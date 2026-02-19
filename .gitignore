@@ -1,0 +1,17 @@
+# Ignore folder contents but keep the folder structure if a .gitkeep exists
+data/*
+!data/.gitkeep
+
+results/*
+!results/.gitkeep
+
+scratch/*
+!scratch/.gitkeep
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+
+# Ignore ArcGIS lock files
+*.lock
+*.lock/
