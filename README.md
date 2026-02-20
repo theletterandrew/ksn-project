@@ -72,7 +72,7 @@ Or download ZIP from GitHub and extract to your desired location.
    ```
 4. **Verification:** You should see a `bin` folder inside `bin/LAStools` (e.g., `bin/LAStools/bin/laszip.exe`)
 
-### 4. Run Project Initialization  Run setup_project.py to populate the folders in the project.
+### 4. Run Project Initialization
 1. **Important:** Open the **ArcGIS Python Command Prompt** and navigate to the project folder:
 ```bash
 cd C:\Path\To\Your\SanBernardino_Ksn_Project
@@ -88,7 +88,11 @@ setup.bat
 
 **Verification:** You should see a message saying that the setup is complete.
 
-### 5. Run the Pipeline
+### 5. Adjust Parameters
+1. Open `config.py` to view the parameters of the script.
+2. Choose whether or not you would like to run the program on a test run or not by changing the value of `TEST_RUN`
+
+### 6. Run the Pipeline
 
 Execute the main pipeline script:
 ```bash
