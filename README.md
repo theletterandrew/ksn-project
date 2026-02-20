@@ -73,13 +73,13 @@ Or download ZIP from GitHub and extract to your desired location.
 4. **Verification:** You should see a `bin` folder inside `bin/LAStools` (e.g., `bin/LAStools/bin/laszip.exe`)
 
 ### 4. Run Project Initialization
-
-**Important:** Open the **ArcGIS Python Command Prompt** and navigate to the project folder:
+1.  Run setup_project.py to populate the folders in the project.
+2. **Important:** Open the **ArcGIS Python Command Prompt** and navigate to the project folder:
 ```bash
 cd C:\Path\To\Your\SanBernardino_Ksn_Project
 ```
 
-Run the setup batch file:
+3. Run the setup batch file:
 ```bash
 setup.bat
 ```
