@@ -77,11 +77,7 @@ Or download ZIP from GitHub and extract to your desired location.
 ```bash
 cd C:\Path\To\Your\SanBernardino_Ksn_Project
 ```
-2. Run the project setup script:
-```bash
-python setup_project.py
-```
-3. Run the setup batch file:
+2. Run the setup batch file:
 ```bash
 setup.bat
 ```
