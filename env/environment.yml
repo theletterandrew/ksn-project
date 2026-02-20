@@ -4,14 +4,14 @@ channels:
   - conda-forge
   - defaults
 dependencies:
-  - python=3.11 # Or whatever version your ArcGIS Pro uses
-  - scipi
+  - python=3.11
+  - scipy
   - laspy
+  - lazrs-python
   - numpy
   - pandas
   - pdal
   - rasterio
-  - scipi
   - shapely
   - whitebox
   - geopandas

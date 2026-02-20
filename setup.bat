@@ -3,7 +3,7 @@ echo ==================================================
 echo   San Bernardino Ksn: Environment Setup
 echo ==================================================
 
-:: 1. Safety Check: Verify we are in the right folder
+:: 1. Safety Check
 if not exist "setup_project.py" (
     echo [ERROR] setup_project.py not found in this directory.
     echo Please 'cd' into your project folder before running this script.
@@ -11,25 +11,47 @@ if not exist "setup_project.py" (
     exit /b
 )
 
-:: 2. Create the Conda Environment
-echo [1/3] Building ksn_env from environment.yml...
-call conda env create -f env/environment.yml --quiet
+:: 2. Find conda installation
+echo [1/3] Locating conda...
+call conda --version >nul 2>&1
 if errorlevel 1 (
-    echo [INFO] Environment may already exist, skipping creation...
+    echo [ERROR] conda not found. Make sure Anaconda/Miniconda is installed
+    echo and that you are running this from the ArcGIS Pro Python Command Prompt.
+    pause
+    exit /b
 )
 
-:: 3. Activate the Environment
-echo [2/3] Activating ksn_env...
-call conda init
-call conda activate ksn_env
+:: 3. Create the Conda Environment
+echo [2/3] Building ksn_env from environment.yml...
+call conda env create -f env/environment.yml
+if errorlevel 1 (
+    echo [INFO] Environment already exists. Updating instead...
+    call conda env update -f env/environment.yml --prune
+)
 
-:: 4. Run Python Verification
+:: 4. Verify environment was created
+call conda env list | findstr "ksn_env" >nul
+if errorlevel 1 (
+    echo [ERROR] ksn_env was not created successfully. Check environment.yml for errors.
+    pause
+    exit /b
+)
+
+:: 5. Run verification script inside ksn_env directly (no activate needed)
 echo [3/3] Running project verification...
-python setup_project.py
+call conda run -n ksn_env python setup_project.py
+if errorlevel 1 (
+    echo [ERROR] Verification script failed.
+    pause
+    exit /b
+)
 
 echo.
-echo Setup Complete! 
-echo You are now working within the 'ksn_env' environment.
 echo ==================================================
-:: Keeps the prompt open and active in the new environment
-cmd /k
+echo Setup Complete!
+echo To use this environment in future sessions, run:
+echo     conda activate ksn_env
+echo ==================================================
+
+:: Open a new prompt with ksn_env already active
+cmd /k "conda activate ksn_env"
