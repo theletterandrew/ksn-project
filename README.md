@@ -47,7 +47,7 @@ Visualization & Analysis
 
 Clone the repository or download as ZIP:
 ```bash
-git clone [repository_url]
+git clone https://github.com/theletterandrew/ksn-project
 ```
 
 Or download ZIP from GitHub and extract to your desired location.
