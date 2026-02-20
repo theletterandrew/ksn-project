@@ -81,6 +81,7 @@ cd C:\Path\To\Your\SanBernardino_Ksn_Project
 ```bash
 setup.bat
 ```
+3. When the setup script is finished, enter `conda activate ksn_env`
 
 **Verification:** You should see a message saying that the setup is complete.
 
