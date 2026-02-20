@@ -4,6 +4,7 @@ from pathlib import Path
 # Base Paths
 ROOT_DIR = Path(__file__).resolve().parent
 SCRIPTS_DIR = ROOT_DIR / "scripts"
+FIGURES_DIR = ROOT_DIR / "figures"
 
 # Data Paths
 DATA_RAW = ROOT_DIR / "data" / "raw"
@@ -69,7 +70,7 @@ MIN_DRAINAGE_AREA_CELLS = 10000000
 SNAP_DISTANCE = 50
 
 # --- KSN ANALYSIS PARAMETERS ---
-MIN_DRAINAGE_AREA_M2 = 1e6           # Min drainage area for stream extraction (1 km²)
+MIN_DRAINAGE_AREA_M2 = 1000000           # Min drainage area for stream extraction (1 km²)
 REFERENCE_CONCAVITY  = 0.45          # Reference concavity index (theta_ref)
 SMOOTHING_WINDOW     = 5             # Window size (cells) for gradient smoothing
 SAMPLE_DISTANCE      = 50            # Sample points every N meters along streams

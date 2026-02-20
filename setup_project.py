@@ -29,7 +29,8 @@ def run_setup():
         config.DATA_SCRATCH_WATERSHEDS,
         config.DATA_STREAMS,
         config.DATA_WATERSHEDS,
-        config.DATA_KSN
+        config.DATA_KSN,
+        config.FIGURES_DIR
     ]
     
     for folder in required_dirs:
