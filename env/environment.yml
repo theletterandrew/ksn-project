@@ -14,5 +14,7 @@ dependencies:
   - scipi
   - shapely
   - whitebox
+  - geopandas
+  - matplotlib
   - pip:
       - python-dotenv
