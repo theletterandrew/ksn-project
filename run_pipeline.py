@@ -1,8 +1,10 @@
 import subprocess
 import sys
 import time
+import os
 
-# List your scripts in the exact order they should run
+SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
+
 SCRIPTS_TO_RUN = [
     "batchdownload.py",
     "laz_to_las.py",
@@ -20,22 +22,31 @@ def run_script(script_name):
     print(f"\n{'='*40}")
     print(f"RUNNING: {script_name}")
     print(f"{'='*40}")
-    
+
+    script_path = os.path.join(SCRIPTS_DIR, script_name)
+
+    if not os.path.exists(script_path):
+        print(f"ERROR: Script not found at expected path: {script_path}")
+        return False
+
     start_time = time.time()
-    
+
     try:
-        # sys.executable ensures it uses the same Python environment/conda path
-        result = subprocess.run([sys.executable, script_name], check=True)
-        
+        result = subprocess.run(
+            [sys.executable, script_path],
+            check=True,
+            cwd=os.path.dirname(os.path.abspath(__file__))
+        )
         duration = time.time() - start_time
         print(f"SUCCESS: {script_name} finished in {duration:.2f} seconds.")
         return True
-        
+
     except subprocess.CalledProcessError as e:
         print(f"ERROR: {script_name} failed with exit code {e.returncode}")
         return False
 
 def main():
+    print(f"Scripts directory: {SCRIPTS_DIR}")
     for script in SCRIPTS_TO_RUN:
         success = run_script(script)
         if not success:
