@@ -91,6 +91,7 @@ setup.bat
 ### 5. Adjust Parameters
 1. Open `config.py` to view the parameters of the script.
 2. Choose whether or not you would like to run the program on a test run or not by changing the value of `TEST_RUN`
+3. Adjust any other parameters as you see fit.
 
 ### 6. Run the Pipeline
 
