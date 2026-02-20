@@ -23,6 +23,7 @@ DATA_SCRATCH_WATERSHEDS = DATA_SCRATCH / "watersheds"
 # Tool Paths
 WBT_EXE = ROOT_DIR / "bin" / "WBT" / "whitebox_tools.exe"
 LASZIP_EXE = ROOT_DIR / "bin" / "LAStools" / "bin" / "laszip.exe"
+LASTOOLS_BIN = ROOT_DIR / "bin" / "LAStools" / "bin"
 
 # Project Settings
 SEARCH_RADIUS = 15
