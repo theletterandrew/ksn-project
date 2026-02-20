@@ -4,9 +4,16 @@ import time
 
 # List your scripts in the exact order they should run
 SCRIPTS_TO_RUN = [
+    "batchdownload.py",
     "laz_to_las.py",
-    "filter_ground_points.py",
-    "generate_dem.py"
+    "delete_empty_files.py",
+    "las_to_dem.py",
+    "mosaic_dem.py",
+    "wbt_hydrology.py",
+    "stream_extraction_wbt.py",
+    "delineate_watersheds.py",
+    "calculate_ksn.py",
+    "plot_stream_profiles.py"
 ]
 
 def run_script(script_name):
