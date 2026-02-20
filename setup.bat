@@ -20,6 +20,7 @@ if errorlevel 1 (
 
 :: 3. Activate the Environment
 echo [2/3] Activating ksn_env...
+call conda init
 call conda activate ksn_env
 
 :: 4. Run Python Verification
