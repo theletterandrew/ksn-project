@@ -39,7 +39,7 @@ EPT_URL = "http://usgs-lidar-public.s3.amazonaws.com/USGS_LPC_CA_SoCal_Wildfires
 if TEST_RUN:
     # A small 500m x 500m patch for testing logic
     # Coordinates in EPSG:3857 (Web Mercator)
-    BOUNDS_STR = "([-13030000, -13029500],[4020000, 4020500])"
+    BOUNDS_STR = "([-13007333, -13002333],[4047192, 4052192])"
     print("--- RUNNING IN TEST MODE (Small Area) ---")
 else:
     # The full study area bounds
@@ -61,6 +61,9 @@ MAX_WORKERS = 4
 
 # Stream threshold (in pixels)
 STREAM_THRESHOLD = 1000000    # cells (~4 km² at 2m resolution)
+
+# --- DELETE EMPTY FILES PARAMETERS ---
+MIN_TILE_SIZE_KB = 1
 
 # --- WATERSHED PARAMETERS ---
 # Watershed minimum drainage area threshold (~40 km² at 2m resolution)

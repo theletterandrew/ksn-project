@@ -3,6 +3,13 @@ import sys
 import glob
 from pathlib import Path
 
+# Project root (one level up from scripts/)
+root_dir = Path(__file__).resolve().parent.parent
+if str(root_dir) not in sys.path:
+    sys.path.append(str(root_dir))
+
+import config
+
 # Calculate the path to the project root (one level up from scripts/)
 root_dir = Path(__file__).resolve().parent.parent
 
@@ -15,7 +22,7 @@ import config
 LAS_FOLDER = config.DATA_PROCESSED
 
 to_delete = [f for f in glob.glob(os.path.join(LAS_FOLDER, "*.las"))
-             if os.path.getsize(f) / 1024 < 10]
+             if os.path.getsize(f) / 1024 < config.MIN_TILE_SIZE_KB]
 
 print(f"Found {len(to_delete)} files to delete:")
 for f in to_delete:
