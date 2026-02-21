@@ -3,6 +3,18 @@ import sys
 import time
 import os
 
+sanitize_path()
+
+def sanitize_path():
+    """Remove LAStools from PATH to prevent its GDAL DLL from conflicting with conda-forge's."""
+    paths = os.environ["PATH"].split(os.pathsep)
+    cleaned = [p for p in paths if "LAStools" not in p]
+    os.environ["PATH"] = os.pathsep.join(cleaned)
+
+    # Explicitly prepend the ksn_env DLL directory so rasterio finds the right GDAL
+    ksn_bin = Path(KSNENV_PYTHON).parent.parent / "Library" / "bin"
+    os.environ["PATH"] = str(ksn_bin) + os.pathsep + os.environ["PATH"]
+
 def find_ksn_python():
     """Find the ksn_env Python executable via conda."""
     result = subprocess.run(
