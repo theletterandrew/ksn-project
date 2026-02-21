@@ -101,30 +101,46 @@ def collect_nodes(
         if not boxes_intersect(nb, query_box):
             return nodes  # Node doesn't overlap our tile
 
-        if point_count == -1:
-            # Children are in a separate hierarchy page — fetch it
-            sub_url = f"{base_url}/ept-hierarchy/{key}.json"
-            try:
-                sub_hierarchy = fetch_json(sub_url)
-                hierarchy.update(sub_hierarchy)
-            except Exception:
-                return nodes
+        # Always try to fetch sub-hierarchy page — children may be in a
+        # separate JSON file regardless of whether point_count is -1
+        sub_url = f"{base_url}/ept-hierarchy/{key}.json"
+        try:
+            sub_hierarchy = fetch_json(sub_url)
+            hierarchy.update(sub_hierarchy)
+        except Exception:
+            pass  # No sub-page for this node, that's fine
 
-        nodes.append(key)
+        # Only collect leaf nodes to avoid double-counting points.
+        # A node is a leaf if none of its children exist in the hierarchy.
+        child_keys = [
+            f"{d+1}-{x*2+dx}-{y*2+dy}-{z*2+dz}"
+            for dx in range(2) for dy in range(2) for dz in range(2)
+        ]
+        has_intersecting_children = any(
+            hierarchy.get(ck, 0) > 0 and
+            boxes_intersect(
+                node_bounds(ept_bounds, d+1, x*2+(i//4), y*2+((i//2)%2)), query_box
+            )
+            for i, ck in enumerate(child_keys)
+        )
+        if not has_intersecting_children:
+            nodes.append(key)
+
     else:
         # Root: always check spatial overlap but don't require it in hierarchy
         nb = node_bounds(ept_bounds, d, x, y)
         if not boxes_intersect(nb, query_box):
             return nodes
 
-    # Recurse into children
+    # Recurse into all 8 children (EPT is a full octree: 2x2x2)
     for dx in range(2):
         for dy in range(2):
-            collect_nodes(
-                hierarchy, ept_bounds, query_box, base_url,
-                d + 1, x * 2 + dx, y * 2 + dy, z,
-                nodes
-            )
+            for dz in range(2):
+                collect_nodes(
+                    hierarchy, ept_bounds, query_box, base_url,
+                    d + 1, x * 2 + dx, y * 2 + dy, z * 2 + dz,
+                    nodes
+                )
 
     return nodes
 
