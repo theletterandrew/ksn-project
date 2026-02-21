@@ -39,7 +39,7 @@ EPT_URL = "http://usgs-lidar-public.s3.amazonaws.com/USGS_LPC_CA_SoCal_Wildfires
 if TEST_RUN:
     # A small 500m x 500m patch for testing logic
     # Coordinates in EPSG:3857 (Web Mercator)
-    BOUNDS_STR = "([-13007333, -13002333],[4047192, 4052192])"
+    BOUNDS_STR = "([-13100000, -13095000],[3980000, 3985000])"
     print("--- RUNNING IN TEST MODE (Small Area) ---")
 else:
     # The full study area bounds
