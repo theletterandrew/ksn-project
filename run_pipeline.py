@@ -3,8 +3,6 @@ import sys
 import time
 import os
 
-sanitize_path()
-
 def sanitize_path():
     """Remove LAStools from PATH to prevent its GDAL DLL from conflicting with conda-forge's."""
     paths = os.environ["PATH"].split(os.pathsep)
@@ -88,6 +86,7 @@ def run_script(script_name, python_exec):
         return False
 
 def main():
+    sanitize_path()
     print(f"Scripts directory: {SCRIPTS_DIR}")
     for script, python_exec in SCRIPTS_TO_RUN:
         success = run_script(script, python_exec)
