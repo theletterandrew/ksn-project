@@ -127,16 +127,17 @@ def download_node(base_url: str, key: str) -> bytes:
 
 def run_download(tile_box, filename: str):
     """
-    Downloads all EPT nodes intersecting tile_box, merges them, filters to
-    ground points (Classification=2), and writes a LAZ file.
+    Downloads all EPT nodes intersecting tile_box, filters to ground points
+    (Classification=2) with spatial clipping, and writes a LAZ file.
+    Each node is processed individually to avoid laspy concatenation issues.
     """
     b = tile_box.bounds  # (minx, miny, maxx, maxy)
     query_box = (b[0], b[1], b[2], b[3])
-    base_url = config.EPT_URL.rsplit("/", 1)[0]  # strip ept.json
+    base_url = config.EPT_URL.rsplit("/", 1)[0]
 
     # --- Step 1: Load EPT metadata and root hierarchy ---
     ept_info = fetch_json(config.EPT_URL)
-    ept_bounds = ept_info["bounds"]  # [minx, miny, minz, maxx, maxy, maxz]
+    ept_bounds = ept_info["bounds"]
     hierarchy = fetch_json(f"{base_url}/ept-hierarchy/0-0-0-0.json")
 
     # --- Step 2: Find all nodes that intersect our tile ---
@@ -148,56 +149,59 @@ def run_download(tile_box, filename: str):
             "Check that BOUNDS_STR in config.py is within the dataset extent."
         )
 
-    # --- Step 3: Download and merge all intersecting nodes ---
-    all_points = []
-    header = None
+    # --- Step 3: Download each node, clip and filter, accumulate results ---
+    # Points are processed per-node to avoid laspy concatenation issues
+    # across nodes with different offsets/scales.
+    base_header = None
+    filtered_arrays = []
 
     for key in nodes:
         raw = download_node(base_url, key)
         with laspy.open(io.BytesIO(raw)) as reader:
             las = reader.read()
-            if header is None:
-                header = las.header
-            all_points.append(las.points)
 
-    merged_points = np.concatenate(all_points) if len(all_points) > 1 else all_points[0]
+        if base_header is None:
+            base_header = las.header
 
-    # --- Step 4: Spatial clip to exact tile bounds ---
-    x_offset = header.offsets[0]
-    y_offset = header.offsets[1]
-    x_scale  = header.scales[0]
-    y_scale  = header.scales[1]
+        x_off = las.header.offsets[0]
+        y_off = las.header.offsets[1]
+        x_sc  = las.header.scales[0]
+        y_sc  = las.header.scales[1]
 
-    x_coords = x_offset + x_scale * merged_points.X.astype(np.float64)
-    y_coords = y_offset + y_scale * merged_points.Y.astype(np.float64)
+        x_coords = x_off + x_sc * np.array(las.X, dtype=np.float64)
+        y_coords = y_off + y_sc * np.array(las.Y, dtype=np.float64)
 
-    spatial_mask = (
-        (x_coords >= b[0]) & (x_coords <= b[2]) &
-        (y_coords >= b[1]) & (y_coords <= b[3])
-    )
+        spatial_mask = (
+            (x_coords >= b[0]) & (x_coords <= b[2]) &
+            (y_coords >= b[1]) & (y_coords <= b[3])
+        )
+        ground_mask = np.array(las.classification) == 2
+        final_mask  = spatial_mask & ground_mask
 
-    # --- Step 5: Filter to ground points only (Classification=2) ---
-    ground_mask  = merged_points.classification == 2
-    final_mask   = spatial_mask & ground_mask
-    final_points = merged_points[final_mask]
+        if final_mask.any():
+            filtered_arrays.append(las.points[final_mask])
 
-    if len(final_points) == 0:
+    if not filtered_arrays:
         raise ValueError(
             "No ground points found in this tile after filtering. "
             "The tile may be empty or outside the dataset extent."
         )
 
-    # --- Step 6: Write filtered points as LAZ ---
-    filtered = laspy.LasData(header=header)
-    filtered.points = final_points
+    # --- Step 4: Merge filtered records and write LAZ ---
+    # Concatenate underlying numpy arrays then wrap back into a PackedPointRecord
+    merged_array = np.concatenate([np.array(a) for a in filtered_arrays])
+    final_points = laspy.PackedPointRecord(merged_array, base_header.point_format)
+
+    out_las = laspy.LasData(header=base_header)
+    out_las.points = final_points
 
     with laspy.open(
         filename,
         mode="w",
-        header=filtered.header,
+        header=out_las.header,
         laz_backend=laspy.LazBackend.LazrsParallel
     ) as writer:
-        writer.write_points(filtered.points)
+        writer.write_points(out_las.points)
 
 
 # ---------------------------------------------------------------------------
