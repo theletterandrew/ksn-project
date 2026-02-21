@@ -1,7 +1,6 @@
 name: ksn_env
 channels:
   - conda-forge
-channel_priority: strict
 dependencies:
   - python=3.11
   - gdal
