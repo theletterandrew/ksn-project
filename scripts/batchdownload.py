@@ -67,7 +67,6 @@ def collect_nodes(
     hierarchy: dict,
     ept_bounds: list,
     query_box: tuple,
-    base_url: str,
     d: int = 0,
     x: int = 0,
     y: int = 0,
@@ -78,66 +77,35 @@ def collect_nodes(
     Recursively traverse the EPT hierarchy to collect all node keys
     whose bounds intersect the query bounding box.
 
-    Fetches sub-hierarchy JSON pages as needed (EPT splits large hierarchies
-    into separate JSON files at certain depths).
-
-    Note: The root node (0-0-0-0) is often absent from the hierarchy JSON
-    itself — its existence is implied by ept.json. We handle this by treating
-    the root as always present and starting recursion from its children.
+    All hierarchy data is in 0-0-0-0.json for this dataset — no sub-page
+    fetching needed. Collects all intersecting nodes at every depth; spatial
+    clipping in run_download handles precise boundary enforcement.
     """
     if nodes is None:
         nodes = []
 
     key = f"{d}-{x}-{y}-{z}"
 
-    # Root node is implied — skip the point count check for it
-    # For all other nodes, check if they exist in the hierarchy
+    # Skip nodes not in hierarchy (root at d=0 is implied, so skip check)
     if d > 0:
-        point_count = hierarchy.get(key)
-        if point_count is None or point_count == 0:
-            return nodes  # Node doesn't exist or has no points
-
-        nb = node_bounds(ept_bounds, d, x, y)
-        if not boxes_intersect(nb, query_box):
-            return nodes  # Node doesn't overlap our tile
-
-        # Always try to fetch sub-hierarchy page — children may be in a
-        # separate JSON file regardless of whether point_count is -1
-        sub_url = f"{base_url}/ept-hierarchy/{key}.json"
-        try:
-            sub_hierarchy = fetch_json(sub_url)
-            hierarchy.update(sub_hierarchy)
-        except Exception:
-            pass  # No sub-page for this node, that's fine
-
-        # Only collect leaf nodes to avoid double-counting points.
-        # A node is a leaf if none of its children exist in the hierarchy.
-        child_keys = [
-            f"{d+1}-{x*2+dx}-{y*2+dy}-{z*2+dz}"
-            for dx in range(2) for dy in range(2) for dz in range(2)
-        ]
-        has_intersecting_children = any(
-            hierarchy.get(ck, 0) > 0 and
-            boxes_intersect(
-                node_bounds(ept_bounds, d+1, x*2+(i//4), y*2+((i//2)%2)), query_box
-            )
-            for i, ck in enumerate(child_keys)
-        )
-        if not has_intersecting_children:
-            nodes.append(key)
-
-    else:
-        # Root: always check spatial overlap but don't require it in hierarchy
-        nb = node_bounds(ept_bounds, d, x, y)
-        if not boxes_intersect(nb, query_box):
+        if not hierarchy.get(key):
             return nodes
 
-    # Recurse into all 8 children (EPT is a full octree: 2x2x2)
+    # Prune branches that don't intersect our query box (x/y only)
+    nb = node_bounds(ept_bounds, d, x, y)
+    if not boxes_intersect(nb, query_box):
+        return nodes
+
+    # Collect this node (skip root since it has no data file)
+    if d > 0:
+        nodes.append(key)
+
+    # Recurse into all 8 children (EPT octree: 2x2x2)
     for dx in range(2):
         for dy in range(2):
             for dz in range(2):
                 collect_nodes(
-                    hierarchy, ept_bounds, query_box, base_url,
+                    hierarchy, ept_bounds, query_box,
                     d + 1, x * 2 + dx, y * 2 + dy, z * 2 + dz,
                     nodes
                 )
@@ -172,7 +140,7 @@ def run_download(tile_box, filename: str):
     hierarchy = fetch_json(f"{base_url}/ept-hierarchy/0-0-0-0.json")
 
     # --- Step 2: Find all nodes that intersect our tile ---
-    nodes = collect_nodes(hierarchy, ept_bounds, query_box, base_url)
+    nodes = collect_nodes(hierarchy, ept_bounds, query_box)
 
     if not nodes:
         raise ValueError(
@@ -195,8 +163,6 @@ def run_download(tile_box, filename: str):
     merged_points = np.concatenate(all_points) if len(all_points) > 1 else all_points[0]
 
     # --- Step 4: Spatial clip to exact tile bounds ---
-    # Nodes are coarser than our tile so we clip precisely.
-    # Coordinates are stored as integers: real = offset + scale * int_val
     x_offset = header.offsets[0]
     y_offset = header.offsets[1]
     x_scale  = header.scales[0]
