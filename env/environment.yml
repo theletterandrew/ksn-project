@@ -1,6 +1,5 @@
 name: ksn_env
 channels:
-  - esri
   - conda-forge
   - defaults
 channel_priority: strict

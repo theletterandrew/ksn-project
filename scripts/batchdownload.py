@@ -55,7 +55,7 @@ if __name__ == "__main__":
 
     # Generate Overlapping Tiles
     tiles = []
-    step = config.TILE_SIZE - config.TILE_OVERLAP
+    step = config.TILE_SIZE - config.OVERLAP
 
     # Use while loops to ensure we cover the whole area
     x = p[0]
