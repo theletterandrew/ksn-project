@@ -2,6 +2,7 @@ import subprocess
 import sys
 import time
 import os
+from pathlib import Path
 
 def sanitize_path():
     """Remove LAStools from PATH to prevent its GDAL DLL from conflicting with conda-forge's."""
