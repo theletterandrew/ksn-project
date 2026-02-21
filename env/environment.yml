@@ -9,7 +9,7 @@ dependencies:
   - lazrs-python
   - numpy
   - pandas
-  - pdal
+  - requests
   - rasterio
   - shapely
   - whitebox
