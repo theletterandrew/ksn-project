@@ -80,35 +80,44 @@ def collect_nodes(
 
     Fetches sub-hierarchy JSON pages as needed (EPT splits large hierarchies
     into separate JSON files at certain depths).
+
+    Note: The root node (0-0-0-0) is often absent from the hierarchy JSON
+    itself — its existence is implied by ept.json. We handle this by treating
+    the root as always present and starting recursion from its children.
     """
     if nodes is None:
         nodes = []
 
     key = f"{d}-{x}-{y}-{z}"
-    point_count = hierarchy.get(key, 0)
 
-    if point_count == 0:
-        return nodes  # Node doesn't exist or has no points
+    # Root node is implied — skip the point count check for it
+    # For all other nodes, check if they exist in the hierarchy
+    if d > 0:
+        point_count = hierarchy.get(key)
+        if point_count is None or point_count == 0:
+            return nodes  # Node doesn't exist or has no points
 
-    nb = node_bounds(ept_bounds, d, x, y)
-    if not boxes_intersect(nb, query_box):
-        return nodes  # Node doesn't overlap our tile
+        nb = node_bounds(ept_bounds, d, x, y)
+        if not boxes_intersect(nb, query_box):
+            return nodes  # Node doesn't overlap our tile
 
-    if point_count == -1:
-        # This node's children are in a separate hierarchy page — fetch it
-        sub_url = f"{base_url}/ept-hierarchy/{key}.json"
-        try:
-            sub_hierarchy = fetch_json(sub_url)
-            hierarchy.update(sub_hierarchy)
-            point_count = hierarchy.get(key, 0)
-            if point_count <= 0:
+        if point_count == -1:
+            # Children are in a separate hierarchy page — fetch it
+            sub_url = f"{base_url}/ept-hierarchy/{key}.json"
+            try:
+                sub_hierarchy = fetch_json(sub_url)
+                hierarchy.update(sub_hierarchy)
+            except Exception:
                 return nodes
-        except Exception:
+
+        nodes.append(key)
+    else:
+        # Root: always check spatial overlap but don't require it in hierarchy
+        nb = node_bounds(ept_bounds, d, x, y)
+        if not boxes_intersect(nb, query_box):
             return nodes
 
-    nodes.append(key)
-
-    # Recurse into children (EPT quadtree: 4 children per node in x/y)
+    # Recurse into children
     for dx in range(2):
         for dy in range(2):
             collect_nodes(
