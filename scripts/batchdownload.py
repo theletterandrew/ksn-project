@@ -129,7 +129,7 @@ if __name__ == "__main__":
     # Process Loop
     start_time = time.time()
     for i, tile in enumerate(tiles):
-        out_path = config.DATA_RAW / f"ground_tile_{i+1:03}.laz"
+        out_path = config.DATA_RAW / f"gt_{i+1:03}.laz"
 
         if out_path.exists():
             print(f"[{i+1}/{total}] Skipping {out_path.name} (Exists)")
