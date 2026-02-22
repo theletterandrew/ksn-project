@@ -15,20 +15,8 @@ USAGE:
 Requirements:
     conda install -c conda-forge laspy lazrs-python scipy rasterio pyproj
 """
-
-import logging
 import sys
-import time
 from pathlib import Path
-
-import numpy as np
-import laspy
-import rasterio
-from rasterio.transform import from_bounds
-from rasterio.crs import CRS
-from pyproj import Transformer
-from scipy.spatial import cKDTree
-
 # Calculate the path to the project root (one level up from scripts/)
 root_dir = Path(__file__).resolve().parent.parent
 
@@ -37,12 +25,18 @@ if str(root_dir) not in sys.path:
     sys.path.append(str(root_dir))
 
 import config
+import rasterio
+import logging
+import time
+import numpy as np
+import laspy
+import rasterio
+from rasterio.transform import from_bounds
+from rasterio.crs import CRS
+from pyproj import Transformer
+from scipy.spatial import cKDTree
 
-import os
-os.environ["PATH"] = os.pathsep.join(
-    p for p in os.environ["PATH"].split(os.pathsep) if "LAStools" not in p
-)
-os.environ["GDAL_DRIVER_PATH"] = ""
+
 
 # =============================================================================
 # CONFIG — Edit these before running
