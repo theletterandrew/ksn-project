@@ -38,6 +38,12 @@ if str(root_dir) not in sys.path:
 
 import config
 
+import os
+os.environ["PATH"] = os.pathsep.join(
+    p for p in os.environ["PATH"].split(os.pathsep) if "LAStools" not in p
+)
+os.environ["GDAL_DRIVER_PATH"] = ""
+
 # =============================================================================
 # CONFIG — Edit these before running
 # =============================================================================
