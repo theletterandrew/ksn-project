@@ -149,7 +149,7 @@ def main():
         success = run_wbt("BreachDepressionsLeastCost", {
             "dem":      str(dem_path),
             "output":   str(breached_path),
-            "dist":     "1000",    # Max breach distance in cells
+            "dist": str(config.WBT_BREACH_DIST),  # Max breach distance in cells
             "fill":     "true"     # Fill any remaining depressions after breaching
         }, logger)
         if not success:

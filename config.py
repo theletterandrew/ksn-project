@@ -66,6 +66,12 @@ STREAM_THRESHOLD = 10000 if TEST_RUN else 1000000    # cells (~4 km² at 2m reso
 # --- DELETE EMPTY FILES PARAMETERS ---
 MIN_TILE_SIZE_KB = 1
 
+# --- HYDROLOGY PARAMETERS ---
+# Maximum breach distance in cells for BreachDepressionsLeastCost
+# At 2m resolution: 100 cells = 200m (suitable for small test areas)
+#                   1000 cells = 2km  (suitable for full study area)
+WBT_BREACH_DIST = 100 if TEST_RUN else 1000
+
 # --- WATERSHED PARAMETERS ---
 # Watershed minimum drainage area threshold (~40 km² at 2m resolution)
 MIN_DRAINAGE_AREA_CELLS = 10000000
