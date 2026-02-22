@@ -1,15 +1,6 @@
 import os
 from pathlib import Path
-import os
 
-# Must run before any rasterio/gdal imports to ensure conda-forge DLLs
-# are loaded instead of LAStools' conflicting gdal.dll
-_ksn_env_bin = os.path.join(os.path.dirname(os.environ.get("CONDA_PREFIX", "")), 
-                             "ksn_env", "Library", "bin")
-if os.path.exists(_ksn_env_bin):
-    os.add_dll_directory(_ksn_env_bin)
-
-os.environ["GDAL_DRIVER_PATH"] = ""
 # Base Paths
 ROOT_DIR = Path(__file__).resolve().parent
 SCRIPTS_DIR = ROOT_DIR / "scripts"
