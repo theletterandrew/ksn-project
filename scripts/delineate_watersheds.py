@@ -41,7 +41,7 @@ import config
 # =============================================================================
 
 WBT_DIR         = config.DATA_SCRATCH_WBT                    # Folder with WBT outputs
-STREAMS_SHP     = config.DATA_STREAMS                        # Stream network
+STREAMS_SHP     = config.DATA_STREAMS / "streams_connected.shp"                      # Stream network
 OUTPUT_DIR      = config.DATA_SCRATCH_WATERSHEDS             # Output folder
 
 FAC_FILE        = "flow_accumulation.tif"   # Flow accumulation from WBT
