@@ -50,7 +50,7 @@ import config
 # =============================================================================
 
 WBT_DIR            = config.DATA_SCRATCH_WBT                # WBT outputs (flow acc/dir)
-WATERSHED_DEMS_DIR = config.DATA_SCRATCH_DEMS               # Watershed DEMs
+WATERSHED_DEMS_DIR = config.DATA_WATERSHEDS               # Watershed DEMs
 OUTPUT_DIR         = config.DATA_KSN                        # Output ksn shapefiles
 
 FAC_FILE = "flow_accumulation.tif"   # Flow accumulation from WBT

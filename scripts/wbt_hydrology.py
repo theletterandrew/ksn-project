@@ -181,7 +181,8 @@ def main():
         logger.info("=" * 60)
         success = run_wbt("D8Pointer", {
             "dem":    str(filled_path),
-            "output": str(fdr_path)
+            "output": str(fdr_path),
+            "esri_pntr": "true"
         }, logger)
         if not success:
             logger.error("Flow direction failed. Exiting.")
@@ -198,7 +199,8 @@ def main():
             "input":  str(fdr_path),
             "output": str(fac_path),
             "out_type": "cells",
-            "pntr": "true"
+            "pntr": "true",
+            "esri_pntr": "true"
         }, logger)
         if not success:
             logger.error("Flow accumulation failed. Exiting.")
