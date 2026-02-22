@@ -125,6 +125,19 @@ def main():
                 mosaic_type = "LAST",
                 colormap    = "FIRST"
             )
+        # Re-export as a clean GeoTIFF that WhiteboxTools can read.
+        clean_path = output_dir / "dem_mosaic_wbt.tif"
+        if not clean_path.exists():
+            logger.info("Exporting clean GeoTIFF for WhiteboxTools...")
+            arcpy.management.CopyRaster(
+                in_raster       = str(out_path),
+                out_rasterdataset = str(clean_path),
+                format          = "TIFF",
+                pixel_type      = "32_BIT_FLOAT",
+                nodata_value    = "-9999"
+        )
+
+        logger.info(f"Clean GeoTIFF written: {clean_path.name}")
 
         elapsed  = time.time() - start_time
         rate     = b / elapsed
