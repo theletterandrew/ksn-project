@@ -75,7 +75,7 @@ RES = 2.0
 MAX_WORKERS = 4
 
 # Stream threshold (in pixels)
-STREAM_THRESHOLD = 10000 if TEST_RUN else 1000000    # cells (~4 km² at 2m resolution)
+MIN_DRAINAGE_AREA_CELLS = 900000 if TEST_RUN else 10000000    # cells (~4 km² at 2m resolution)
 
 # --- DELETE EMPTY FILES PARAMETERS ---
 MIN_TILE_SIZE_KB = 1
@@ -90,11 +90,14 @@ WBT_BREACH_DIST = 100 if TEST_RUN else 1000
 # Watershed minimum drainage area threshold
 # Test dataset: (~0.4 km^2 at 2m resolution)
 # Full dataset: (~40 km² at 2m resolution)
-MIN_DRAINAGE_AREA_CELLS = 500000 if TEST_RUN else 10000000
+MIN_DRAINAGE_AREA_CELLS = 1100000 if TEST_RUN else 10000000
 
 # Pour points are snapped to the highest flow accumulation cell within
 # this distance to ensure they land exactly on the stream
 SNAP_DISTANCE = 50
+
+# --- STREAM EXTRACTION PARAMETERS ---
+STREAM_THRESHOLD        = 50000 if TEST_RUN else 1000000
 
 # --- KSN ANALYSIS PARAMETERS ---
 MIN_DRAINAGE_AREA_M2 = 1000000           # Min drainage area for stream extraction (1 km²)
