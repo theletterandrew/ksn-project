@@ -248,7 +248,7 @@ def main():
         sys.exit(1)
     
     # Collect watershed DEMs
-    dem_files = sorted(dems_dir.glob("watershed *.tif"))
+    dem_files = sorted(dems_dir.glob("watershed_*.tif"))
     if not dem_files:
         logger.error(f"No watershed_*.tif files found in: {dems_dir}")
         logger.error("Run clip_watersheds.py first.")
