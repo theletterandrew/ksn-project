@@ -161,16 +161,16 @@ def main():
 
         # --- Step 2: Snap pour points to highest flow accumulation ---
         logger.info("Step 2: Snapping pour points to stream cells...")
-        snapped_fc = str(output_dir / "pourpoints_snapped.shp")
         fac_raster = Raster(str(fac_path))
 
-        snapped = SnapPourPoint(
-            in_pour_point_data = outlets_fc,
+        snapped_raster = SnapPourPoint(
+            in_pour_point_data     = outlets_fc,
             in_accumulation_raster = fac_raster,
-            snap_distance = SNAP_DISTANCE
+            snap_distance          = SNAP_DISTANCE
         )
-        snapped.save(snapped_fc)
-        logger.info(f"  Pour points snapped")
+        snapped_tif = str(output_dir / "pourpoints_snapped.tif")
+        snapped_raster.save(snapped_tif)
+        logger.info("  Pour points snapped")
 
         # --- Step 3: Delineate watersheds ---
         logger.info("Step 3: Delineating watersheds...")
@@ -178,7 +178,7 @@ def main():
 
         watersheds_raster = Watershed(
             in_flow_direction_raster = fdr_raster,
-            in_pour_point_data       = snapped_fc
+            in_pour_point_data       = snapped_tif
         )
 
         watersheds_tif = str(output_dir / "watersheds.tif")
@@ -209,7 +209,7 @@ def main():
         # Clean up intermediate files
         logger.info("Cleaning up intermediate files...")
         for temp_file in [endpoints_fc, str(output_dir / "endpoints_with_fac.shp"),
-                          outlets_fc, snapped_fc, watersheds_tif]:
+                          outlets_fc, snapped_tif, watersheds_tif]:
             try:
                 arcpy.management.Delete(temp_file)
             except Exception:
