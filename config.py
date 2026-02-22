@@ -1,5 +1,19 @@
-import os
 from pathlib import Path
+import os
+
+_conda_prefix = os.environ.get("CONDA_PREFIX", "")
+if _conda_prefix:
+    _dll_dir = os.path.join(_conda_prefix, "Library", "bin")
+    if os.path.exists(_dll_dir):
+        os.add_dll_directory(_dll_dir)
+    
+    # Force pyproj to use the correct PROJ data directory
+    _proj_data = os.path.join(_conda_prefix, "Library", "share", "proj")
+    if os.path.exists(_proj_data):
+        os.environ["PROJ_DATA"] = _proj_data
+        os.environ["PROJ_LIB"] = _proj_data
+
+os.environ["GDAL_DRIVER_PATH"] = ""
 
 # Base Paths
 ROOT_DIR = Path(__file__).resolve().parent
