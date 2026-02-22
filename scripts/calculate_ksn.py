@@ -110,19 +110,22 @@ def extract_stream_points(dem_path: Path, fac_path: Path,
     """
     # Load DEM
     with rasterio.open(str(dem_path)) as src:
-        dem      = src.read(1)
+        dem       = src.read(1)
         transform = src.transform
         crs       = src.crs
         cellsize  = src.res[0]  # Assumes square cells
         nodata    = src.nodata
-    
+        dem_bounds = src.bounds
+
     # Mask nodata
     if nodata is not None:
         dem = np.where(dem == nodata, np.nan, dem)
-    
-    # Load flow accumulation
-    with rasterio.open(str(fac_path)) as src:
-        fac = src.read(1).astype(float)
+
+    # Load flow accumulation clipped to DEM extent
+    # FAC covers the full study area; watershed DEMs are subsets of it
+    with rasterio.open(str(fac_path)) as fac_src:
+        fac_window = fac_src.window(*dem_bounds)
+        fac = fac_src.read(1, window=fac_window).astype(float)
     
     # Calculate drainage area in m²
     area_m2 = fac * (cellsize ** 2)
