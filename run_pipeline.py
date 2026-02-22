@@ -4,15 +4,27 @@ import time
 import os
 from pathlib import Path
 
-def sanitize_path():
-    """Remove LAStools from PATH to prevent its GDAL DLL from conflicting with conda-forge's."""
-    paths = os.environ["PATH"].split(os.pathsep)
-    cleaned = [p for p in paths if "LAStools" not in p]
-    os.environ["PATH"] = os.pathsep.join(cleaned)
+def sanitize_env():
+    """Return a copy of the environment safe for running ksn_env scripts."""
+    env = os.environ.copy()
 
-    # Explicitly prepend the ksn_env DLL directory so rasterio finds the right GDAL
-    ksn_bin = Path(KSNENV_PYTHON).parent.parent / "Library" / "bin"
-    os.environ["PATH"] = str(ksn_bin) + os.pathsep + os.environ["PATH"]
+    # Strip LAStools from PATH to prevent its gdal.dll from conflicting
+    env["PATH"] = os.pathsep.join(
+        p for p in env["PATH"].split(os.pathsep) if "LAStools" not in p
+    )
+
+    # Suppress ArcGIS GDAL plugins
+    env["GDAL_DRIVER_PATH"] = ""
+
+    # Force pyproj/GDAL to use conda-forge's PROJ data, not a system install
+    conda_prefix = env.get("CONDA_PREFIX", "")
+    if conda_prefix:
+        proj_data = os.path.join(conda_prefix, "Library", "share", "proj")
+        if os.path.exists(proj_data):
+            env["PROJ_DATA"] = proj_data
+            env["PROJ_LIB"]  = proj_data
+
+    return env
 
 def find_ksn_python():
     """Find the ksn_env Python executable via conda."""
@@ -87,8 +99,9 @@ def run_script(script_name, python_exec):
         print(f"ERROR: {script_name} failed with exit code {e.returncode}")
         return False
 
+CLEAN_ENV = sanitize_env()
+
 def main():
-    sanitize_path()
     print(f"Scripts directory: {SCRIPTS_DIR}")
     for script, python_exec in SCRIPTS_TO_RUN:
         success = run_script(script, python_exec)
