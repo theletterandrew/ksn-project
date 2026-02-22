@@ -61,7 +61,7 @@ RES = 2.0
 MAX_WORKERS = 4
 
 # Stream threshold (in pixels)
-STREAM_THRESHOLD = 1000000    # cells (~4 km² at 2m resolution)
+STREAM_THRESHOLD = 10000 if TEST_RUN else 1000000    # cells (~4 km² at 2m resolution)
 
 # --- DELETE EMPTY FILES PARAMETERS ---
 MIN_TILE_SIZE_KB = 1
