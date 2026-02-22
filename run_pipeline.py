@@ -89,7 +89,8 @@ def run_script(script_name, python_exec):
         subprocess.run(
             [python_exec, script_path],
             check=True,
-            cwd=os.path.dirname(os.path.abspath(__file__))
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            env=CLEAN_ENV
         )
         duration = time.time() - start_time
         print(f"SUCCESS: {script_name} finished in {duration:.2f} seconds.")
