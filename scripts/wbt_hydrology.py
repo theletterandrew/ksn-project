@@ -197,7 +197,8 @@ def main():
         success = run_wbt("D8FlowAccumulation", {
             "input":  str(fdr_path),
             "output": str(fac_path),
-            "out_type": "cells"    # Output in number of upstream cells
+            "out_type": "cells",
+            "pntr": "true"
         }, logger)
         if not success:
             logger.error("Flow accumulation failed. Exiting.")
