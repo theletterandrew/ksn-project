@@ -142,6 +142,8 @@ def run_download(tile_box, filename: str):
 
     # --- Step 2: Find all nodes that intersect our tile ---
     nodes = collect_nodes(hierarchy, ept_bounds, query_box)
+    if hierarchy is None:
+        raise ValueError("Failed to fetch EPT hierarchy - got None response.")
 
     if not nodes:
         raise ValueError(
@@ -150,8 +152,6 @@ def run_download(tile_box, filename: str):
         )
 
     # --- Step 3: Download each node, clip and filter, accumulate results ---
-    # Points are processed per-node to avoid laspy concatenation issues
-    # across nodes with different offsets/scales.
     base_header = None
     filtered_arrays = []
 
@@ -168,18 +168,21 @@ def run_download(tile_box, filename: str):
         x_sc  = las.header.scales[0]
         y_sc  = las.header.scales[1]
 
-        x_coords = x_off + x_sc * np.array(las.X, dtype=np.float64)
-        y_coords = y_off + y_sc * np.array(las.Y, dtype=np.float64)
+        # Work with the raw numpy array directly — avoid laspy point record indexing
+        raw_array = las.points.array
+
+        x_coords = x_off + x_sc * raw_array["X"].astype(np.float64)
+        y_coords = y_off + y_sc * raw_array["Y"].astype(np.float64)
 
         spatial_mask = (
             (x_coords >= b[0]) & (x_coords <= b[2]) &
             (y_coords >= b[1]) & (y_coords <= b[3])
         )
-        ground_mask = np.array(las.classification) == 2
+        ground_mask = raw_array["raw_classification"] == 2
         final_mask  = spatial_mask & ground_mask
 
         if final_mask.any():
-            filtered_arrays.append(las.points[final_mask])
+            filtered_arrays.append(raw_array[final_mask])
 
     if not filtered_arrays:
         raise ValueError(
@@ -187,9 +190,8 @@ def run_download(tile_box, filename: str):
             "The tile may be empty or outside the dataset extent."
         )
 
-    # --- Step 4: Merge filtered records and write LAZ ---
-    # Concatenate underlying numpy arrays then wrap back into a PackedPointRecord
-    merged_array = np.concatenate([np.array(a) for a in filtered_arrays])
+    # --- Step 4: Merge and write LAZ ---
+    merged_array = np.concatenate(filtered_arrays)
     final_points = laspy.PackedPointRecord(merged_array, base_header.point_format)
 
     out_las = laspy.LasData(header=base_header)
@@ -261,6 +263,8 @@ if __name__ == "__main__":
             eta_min = (elapsed * remaining) / 60
             print(f" Done in {elapsed:.1f}s | Est. Remaining: {eta_min:.1f} min")
         except Exception as e:
-            print(f" FAILED. Error: {e}")
+            import traceback
+            print(f" FAILED")
+            traceback.print_exc()
 
     print(f"\nTotal Process Complete in {(time.time() - start_time)/60:.2f} minutes.")

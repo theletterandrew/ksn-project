@@ -43,6 +43,7 @@ SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"
 SCRIPTS_TO_RUN = [
     ("batchdownload.py",           KSNENV_PYTHON),
     ("laz_to_las.py",              KSNENV_PYTHON),
+    ("inspect_las.py",             KSNENV_PYTHON),
     ("delete_empty_files.py",      KSNENV_PYTHON),
     ("las_to_dem.py",              KSNENV_PYTHON),
     ("mosaic_dem.py",              ARCGIS_PYTHON),
