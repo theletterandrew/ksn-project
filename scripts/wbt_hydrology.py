@@ -74,7 +74,7 @@ def run_wbt(tool: str, args: dict, logger: logging.Logger) -> bool:
     Runs a WhiteboxTools command. Returns True on success.
     args is a dict of parameter name -> value.
     """
-    cmd = [WBT_EXE, f"--run={tool}"]
+    cmd = [str(WBT_EXE), f"--run={tool}"]
     for key, val in args.items():
         cmd.append(f"--{key}={val}")
 
@@ -123,7 +123,7 @@ def main():
     # Verify WhiteboxTools is accessible
     try:
         result = subprocess.run(
-            [WBT_EXE, "--version"],
+            [str(WBT_EXE), "--version"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
         )
         logger.info(f"WhiteboxTools version: {result.stdout.strip()}")
