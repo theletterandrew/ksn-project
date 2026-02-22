@@ -192,7 +192,7 @@ def main():
         arcpy.conversion.RasterToPolygon(
             in_raster      = watersheds_tif,
             out_polygon_features = watersheds_poly,
-            simplify_polygons    = "SIMPLIFY"
+            simplify    = "SIMPLIFY"
         )
 
         watershed_count = int(arcpy.management.GetCount(watersheds_poly)[0])
