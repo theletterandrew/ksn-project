@@ -32,6 +32,7 @@ from pathlib import Path
 
 import numpy as np
 import rasterio
+from rasterio.warp import reproject, Resampling
 from scipy.ndimage import generic_filter
 import geopandas as gpd
 from shapely.geometry import Point
@@ -99,39 +100,42 @@ def calculate_gradient_smoothed(dem: np.ndarray, cellsize: float,
     
     return slope
 
-
 def extract_stream_points(dem_path: Path, fac_path: Path,
-                          min_area_m2: float, sample_dist: float,
-                          theta: float, window_size: int,
-                          logger: logging.Logger) -> gpd.GeoDataFrame:
-    """
-    Extracts stream points with ksn values from a watershed DEM.
-    Returns a GeoDataFrame with point geometry and attributes.
-    """
-    # Load DEM
+                        min_area_m2: float, sample_dist: float,
+                        theta: float, window_size: int,
+                        logger: logging.Logger) -> gpd.GeoDataFrame:
+    # 1. Load the Watershed DEM
     with rasterio.open(str(dem_path)) as src:
         dem       = src.read(1)
         transform = src.transform
         crs       = src.crs
-        cellsize  = src.res[0]  # Assumes square cells
+        cellsize  = src.res[0]
         nodata    = src.nodata
-        dem_bounds = src.bounds
 
-    # Mask nodata
-    if nodata is not None:
-        dem = np.where(dem == nodata, np.nan, dem)
-
-    # Load flow accumulation clipped to DEM extent
-    # FAC covers the full study area; watershed DEMs are subsets of it
+    # 2. Match the FAC to the DEM pixel-for-pixel
     with rasterio.open(str(fac_path)) as fac_src:
-        fac_window = fac_src.window(*dem_bounds)
-        fac = fac_src.read(1, window=fac_window).astype(float)
+        # Create an empty array the same shape as your DEM
+        fac = np.zeros(dem.shape, dtype=np.float32)
+        
+        # Reproject/Resample the FAC to match the DEM's grid exactly
+        reproject(
+            source=rasterio.band(fac_src, 1),
+            destination=fac,
+            src_transform=fac_src.transform,
+            src_crs=fac_src.crs,
+            dst_transform=transform,
+            dst_crs=crs,
+            resampling=Resampling.nearest # Maintain exact accumulation values
+        )
     
-    # Calculate drainage area in m²
-    area_m2 = fac * (cellsize ** 2)
+        # 3. Calculate drainage area
+        area_m2 = fac * (cellsize ** 2)
     
-    # Extract stream mask (cells above threshold)
+    # DEBUG: Log the maximum area found in this specific watershed
+    logger.info(f"  Max area in DEM: {np.nanmax(area_m2):.2f} m2 | Threshold: {min_area_m2} m2")
+    
     stream_mask = area_m2 >= min_area_m2
+
     
     if not stream_mask.any():
         logger.warning(f"  No stream cells above threshold")
