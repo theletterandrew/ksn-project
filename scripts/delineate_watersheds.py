@@ -206,6 +206,30 @@ def main():
         watersheds_raster.save(watersheds_tif)
         logger.info("  Watershed raster created")
 
+        # --- Step 3: Delineate watersheds ---
+        logger.info("Step 3: Delineating watersheds...")
+
+        if not CONDITIONED_DEM.exists():
+            logger.error(f"Conditioned DEM not found: {CONDITIONED_DEM}. Run wbt_hydrology.py first.")
+            sys.exit(1)
+
+        # Generate an ArcGIS-native Flow Direction raster to avoid 'Invalid Pointer' errors
+        logger.info("  Generating ArcGIS-native Flow Direction...")
+        arc_fdr = arcpy.sa.FlowDirection(
+            in_surface_raster = str(CONDITIONED_DEM),
+            flow_direction_type = "D8"
+        )
+
+        # Run Watershed delineation
+        watersheds_raster = Watershed(
+            in_flow_direction_raster = arc_fdr,
+            in_pour_point_data       = snapped_tif
+        )
+
+        watersheds_tif = str(output_dir / "watersheds.tif")
+        watersheds_raster.save(watersheds_tif)
+        logger.info("  Watershed raster created")
+        
         # --- Step 4: Convert to polygons ---
         logger.info("Step 4: Converting watersheds to polygons...")
         watersheds_poly = str(output_dir / "watersheds.shp")
