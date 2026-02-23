@@ -174,13 +174,17 @@ def main():
 
         # --- Step 3: Delineate watersheds ---
         logger.info("Step 3: Delineating watersheds...")
-        fdr_raster = Raster(str(fdr_path))
+
+        # Convert WBT flow direction to ArcGIS-compatible integer raster
+        # WBT nodata (-32768) needs to be explicitly handled
+        from arcpy.sa import Int, SetNull
+        fdr_raw    = Raster(str(fdr_path))
+        fdr_raster = SetNull(fdr_raw == -32768, Int(fdr_raw))
 
         watersheds_raster = Watershed(
             in_flow_direction_raster = fdr_raster,
             in_pour_point_data       = snapped_tif
         )
-
         watersheds_tif = str(output_dir / "watersheds.tif")
         watersheds_raster.save(watersheds_tif)
         logger.info("  Watershed raster created")
