@@ -159,27 +159,23 @@ def main():
             logger.error("No outlets found above threshold. Lower MIN_DRAINAGE_AREA_CELLS.")
             sys.exit(1)
 
-# --- Step 2: Snap pour points to highest flow accumulation ---
-        logger.info("Step 2: Snapping pour points to stream cells...")
-        fac_raster = Raster(str(fac_path))
+# --- Step 2: Convert pour points directly to raster ---
+        logger.info("Step 2: Converting pour points to raster...")
 
-        # Add unique integer ID field for watershed delineation
-        # Without this, all pour points get gridcode=0 and merge into one watershed
-        arcpy.management.AddField(outlets_fc, "POUR_ID", "SHORT")
-        with arcpy.da.UpdateCursor(outlets_fc, ["POUR_ID"]) as cursor:
-            for i, row in enumerate(cursor, start=1):
-                row[0] = i
-                cursor.updateRow(row)
-
-        snapped_raster = SnapPourPoint(
-            in_pour_point_data     = outlets_fc,
-            in_accumulation_raster = fac_raster,
-            snap_distance          = SNAP_DISTANCE,
-            pour_point_field       = "POUR_ID"
-        )
         snapped_tif = str(output_dir / "pourpoints_snapped.tif")
-        snapped_raster.save(snapped_tif)
-        logger.info("  Pour points snapped")
+
+        # Get cell size from FAC raster
+        fac_desc  = arcpy.Describe(str(fac_path))
+        cell_size = fac_desc.meanCellWidth
+
+        arcpy.conversion.PointToRaster(
+            in_features      = outlets_fc,
+            value_field      = "POUR_ID",
+            out_rasterdataset = snapped_tif,
+            cell_assignment  = "MAXIMUM",
+            cellsize         = cell_size
+        )
+        logger.info("  Pour points rasterized")
 
         # --- Step 3: Delineate watersheds ---
         logger.info("Step 3: Delineating watersheds...")
