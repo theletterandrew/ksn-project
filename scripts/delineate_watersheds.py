@@ -40,12 +40,13 @@ import config
 # CONFIG — Edit these before running
 # =============================================================================
 
-WBT_DIR         = config.DATA_SCRATCH_WBT                    # Folder with WBT outputs
-STREAMS_SHP     = config.DATA_STREAMS / "streams_connected.shp"                      # Stream network
-OUTPUT_DIR      = config.DATA_SCRATCH_WATERSHEDS             # Output folder
+WBT_DIR         = config.DATA_SCRATCH_WBT
+STREAMS_SHP     = config.DATA_STREAMS / "streams_connected.shp"
+OUTPUT_DIR      = config.DATA_SCRATCH_WATERSHEDS
 
-FAC_FILE        = "flow_accumulation.tif"   # Flow accumulation from WBT
-FDR_FILE        = "flow_direction.tif"      # Flow direction from WBT
+# Use the 'filled' DEM created by wbt_hydrology.py as the source for Arc's FDR
+CONDITIONED_DEM = WBT_DIR / "dem_filled.tif" 
+FAC_FILE        = WBT_DIR / "flow_accumulation.tif"
 
 # Minimum drainage area threshold for watershed outlets
 # Only stream segments with drainage area >= this value will get watersheds
