@@ -92,7 +92,7 @@ WBT_BREACH_DIST = 100 if TEST_RUN else 1000
 # Watershed minimum drainage area threshold
 # Test dataset: (~0.4 km^2 at 2m resolution)
 # Full dataset: (~40 km² at 2m resolution)
-MIN_DRAINAGE_AREA_CELLS = 1100000 if TEST_RUN else 10000000
+MIN_WATERSHED_AREA = 10000 if TEST_RUN else 10000000
 
 # Pour points are snapped to the highest flow accumulation cell within
 # this distance to ensure they land exactly on the stream
