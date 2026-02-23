@@ -100,7 +100,7 @@ SNAP_DISTANCE = 50
 STREAM_THRESHOLD        = 50000 if TEST_RUN else 1000000
 
 # --- KSN ANALYSIS PARAMETERS ---
-MIN_DRAINAGE_AREA_M2 = 1000000           # Min drainage area for stream extraction (1 km²)
+MIN_DRAINAGE_AREA_M2 = 100000 if TEST_RUN else 1000000  # 0.1 km² for test
 REFERENCE_CONCAVITY  = 0.45          # Reference concavity index (theta_ref)
 SMOOTHING_WINDOW     = 5             # Window size (cells) for gradient smoothing
 SAMPLE_DISTANCE      = 50            # Sample points every N meters along streams
