@@ -24,6 +24,10 @@ LAS_FOLDER = config.DATA_PROCESSED
 to_delete = [f for f in glob.glob(os.path.join(LAS_FOLDER, "*.las"))
              if os.path.getsize(f) / 1024 < config.MIN_TILE_SIZE_KB]
 
+if not to_delete:
+    print(f"No files found smaller than {config.MIN_TILE_SIZE_KB} KB. Nothing to do.")
+    sys.exit(0)
+
 print(f"Found {len(to_delete)} files to delete:")
 for f in to_delete:
     print(f"  {os.path.basename(f)}")
