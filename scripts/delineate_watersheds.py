@@ -159,8 +159,16 @@ def main():
             logger.error("No outlets found above threshold. Lower MIN_DRAINAGE_AREA_CELLS.")
             sys.exit(1)
 
-# --- Step 2: Convert pour points directly to raster ---
+        # --- Step 2: Convert pour points directly to raster ---
         logger.info("Step 2: Converting pour points to raster...")
+
+        # Add unique integer ID to each outlet so each gets its own watershed
+        arcpy.management.AddField(outlets_fc, "POUR_ID", "SHORT")
+        with arcpy.da.UpdateCursor(outlets_fc, ["POUR_ID"]) as cursor:
+            for i, row in enumerate(cursor, start=1):
+                row[0] = i
+                cursor.updateRow(row)
+        logger.info(f"  Assigned POUR_ID to {outlet_count} outlets")
 
         snapped_tif = str(output_dir / "pourpoints_snapped.tif")
 
@@ -169,11 +177,11 @@ def main():
         cell_size = fac_desc.meanCellWidth
 
         arcpy.conversion.PointToRaster(
-            in_features      = outlets_fc,
-            value_field      = "POUR_ID",
+            in_features       = outlets_fc,
+            value_field       = "POUR_ID",
             out_rasterdataset = snapped_tif,
-            cell_assignment  = "MAXIMUM",
-            cellsize         = cell_size
+            cell_assignment   = "MAXIMUM",
+            cellsize          = cell_size
         )
         logger.info("  Pour points rasterized")
 
