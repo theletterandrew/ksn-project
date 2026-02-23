@@ -88,20 +88,19 @@ def main():
     logger = setup_logging(output_dir)
 
     fac_path    = wbt_dir / FAC_FILE
-    fdr_path    = wbt_dir / FDR_FILE
     streams_shp = Path(STREAMS_SHP)
 
     # Validate inputs
     if not fac_path.exists():
         logger.error(f"Flow accumulation not found: {fac_path}")
         sys.exit(1)
-    if not fdr_path.exists():
-        logger.error(f"Flow direction not found: {fdr_path}")
-        sys.exit(1)
     if not streams_shp.exists():
         logger.error(f"Stream network not found: {streams_shp}")
         sys.exit(1)
-
+    if not CONDITIONED_DEM.exists():
+        logger.error(f"Conditioned DEM (dem_filled.tif) not found: {CONDITIONED_DEM}")
+        logger.error("Run wbt_hydrology.py first.")
+        sys.exit(1)
     # Check Spatial Analyst license
     if arcpy.CheckExtension("Spatial") == "Available":
         arcpy.CheckOutExtension("Spatial")
@@ -185,26 +184,6 @@ def main():
             cellsize          = cell_size
         )
         logger.info("  Pour points rasterized")
-
-        # --- Step 3: Delineate watersheds ---
-        logger.info("Step 3: Delineating watersheds...")
-
-        # 1. Use the conditioned DEM (from WBT) to create an ArcGIS-native FDR
-        # This DEM was already breached/filled by WBT, so it's ready for Arc
-        conditioned_dem_path = wbt_dir / "dem_conditioned.tif" # Ensure this filename matches your WBT output
-        arc_fdr = arcpy.sa.FlowDirection(
-            in_surface_raster = str(conditioned_dem_path), 
-            flow_direction_type = "D8"
-)
-
-        # 2. Run the Watershed tool using the native Arc FDR
-        watersheds_raster = Watershed(
-            in_flow_direction_raster = arc_fdr,
-            in_pour_point_data       = snapped_tif
-)
-        watersheds_tif = str(output_dir / "watersheds.tif")
-        watersheds_raster.save(watersheds_tif)
-        logger.info("  Watershed raster created")
 
         # --- Step 3: Delineate watersheds ---
         logger.info("Step 3: Delineating watersheds...")
