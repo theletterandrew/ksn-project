@@ -159,14 +159,23 @@ def main():
             logger.error("No outlets found above threshold. Lower MIN_DRAINAGE_AREA_CELLS.")
             sys.exit(1)
 
-        # --- Step 2: Snap pour points to highest flow accumulation ---
+# --- Step 2: Snap pour points to highest flow accumulation ---
         logger.info("Step 2: Snapping pour points to stream cells...")
         fac_raster = Raster(str(fac_path))
+
+        # Add unique integer ID field for watershed delineation
+        # Without this, all pour points get gridcode=0 and merge into one watershed
+        arcpy.management.AddField(outlets_fc, "POUR_ID", "SHORT")
+        with arcpy.da.UpdateCursor(outlets_fc, ["POUR_ID"]) as cursor:
+            for i, row in enumerate(cursor, start=1):
+                row[0] = i
+                cursor.updateRow(row)
 
         snapped_raster = SnapPourPoint(
             in_pour_point_data     = outlets_fc,
             in_accumulation_raster = fac_raster,
-            snap_distance          = SNAP_DISTANCE
+            snap_distance          = SNAP_DISTANCE,
+            pour_point_field       = "POUR_ID"
         )
         snapped_tif = str(output_dir / "pourpoints_snapped.tif")
         snapped_raster.save(snapped_tif)
