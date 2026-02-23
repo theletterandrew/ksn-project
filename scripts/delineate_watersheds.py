@@ -188,16 +188,19 @@ def main():
         # --- Step 3: Delineate watersheds ---
         logger.info("Step 3: Delineating watersheds...")
 
-        # Convert WBT flow direction to ArcGIS-compatible integer raster
-        # WBT nodata (-32768) needs to be explicitly handled
-        from arcpy.sa import Int, SetNull
-        fdr_raw    = Raster(str(fdr_path))
-        fdr_raster = SetNull(fdr_raw == -32768, Int(fdr_raw))
+        # 1. Use the conditioned DEM (from WBT) to create an ArcGIS-native FDR
+        # This DEM was already breached/filled by WBT, so it's ready for Arc
+        conditioned_dem_path = wbt_dir / "dem_conditioned.tif" # Ensure this filename matches your WBT output
+        arc_fdr = arcpy.sa.FlowDirection(
+            in_surface_raster = str(conditioned_dem_path), 
+            flow_direction_type = "D8"
+)
 
+        # 2. Run the Watershed tool using the native Arc FDR
         watersheds_raster = Watershed(
-            in_flow_direction_raster = fdr_raster,
+            in_flow_direction_raster = arc_fdr,
             in_pour_point_data       = snapped_tif
-        )
+)
         watersheds_tif = str(output_dir / "watersheds.tif")
         watersheds_raster.save(watersheds_tif)
         logger.info("  Watershed raster created")
