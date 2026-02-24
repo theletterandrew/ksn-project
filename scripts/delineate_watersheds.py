@@ -403,6 +403,36 @@ def main():
 
     temp_pour_raster.unlink(missing_ok=True)
 
+    # -----------------------------------------------------------------
+    # DEBUGGING
+    # -----------------------------------------------------------------
+    
+    # Check what the FDR value is at the snapped pour point location
+    with rasterio.open(snapped_tif) as src:
+        snapped_arr = src.read(1)
+        nodata = src.nodata
+        rows, cols = np.where(snapped_arr != nodata)
+        transform = src.transform
+        for r, c in zip(rows, cols):
+            x, y = transform * (c, r)
+            print(f"Pour point ID={snapped_arr[r,c]} at row={r}, col={c}, coords=({x:.1f}, {y:.1f})")
+
+    with rasterio.open(fdr_path) as src:
+        fdr_arr = src.read(1)
+        fdr_nodata = src.nodata
+        for r, c in zip(rows, cols):
+            fdr_val = fdr_arr[r, c]
+            print(f"  FDR value at pour point: {fdr_val}")
+            if fdr_val == 0:
+                print(f"  ERROR: pour point is on a zero/flat cell!")
+            elif fdr_nodata is not None and fdr_val == fdr_nodata:
+                print(f"  ERROR: pour point is on a nodata cell!")
+            else:
+                print(f"  OK: valid FDR value")
+            # Also check surrounding cells
+            window = fdr_arr[max(0,r-3):r+4, max(0,c-3):c+4]
+        print(f"  FDR values in 7x7 neighbourhood:\n{window}")
+
     # ------------------------------------------------------------------
     # Step 3 & 4: WBT watershed delineation → vectorise → area stats
     # ------------------------------------------------------------------
