@@ -125,24 +125,26 @@ def main():
                 mosaic_type = "LAST",
                 colormap    = "FIRST"
             )
-        # Re-export as a clean GeoTIFF that WhiteboxTools can read.
-        clean_path = output_dir / "dem_mosaic_wbt.tif"
-        if not clean_path.exists():
-            logger.info("Exporting clean GeoTIFF for WhiteboxTools...")
-            arcpy.management.CopyRaster(
-                in_raster       = str(out_path),
-                out_rasterdataset = str(clean_path),
-                format          = "TIFF",
-                pixel_type      = "32_BIT_FLOAT",
-                nodata_value    = "-9999"
-        )
-
-        logger.info(f"Clean GeoTIFF written: {clean_path.name}")
 
         elapsed  = time.time() - start_time
         rate     = b / elapsed
         eta_min  = (len(batches) - b) / rate / 60 if rate > 0 else 0
         logger.info(f"Batch {b} complete | elapsed: {elapsed/60:.1f} min | ETA: {eta_min:.1f} min")
+
+    # BUG FIX: CopyRaster must run AFTER all batches complete, not inside the
+    # loop. Previously it ran after batch 1 and was skipped for all subsequent
+    # batches because clean_path.exists() was already True — meaning
+    # dem_mosaic_wbt.tif only ever contained the first 50 tiles.
+    clean_path = output_dir / "dem_mosaic_wbt.tif"
+    logger.info("Exporting clean GeoTIFF for WhiteboxTools...")
+    arcpy.management.CopyRaster(
+        in_raster         = str(out_path),
+        out_rasterdataset = str(clean_path),
+        format            = "TIFF",
+        pixel_type        = "32_BIT_FLOAT",
+        nodata_value      = "-9999"
+    )
+    logger.info(f"Clean GeoTIFF written: {clean_path.name}")
 
     elapsed_total = time.time() - start_time
     size_gb       = out_path.stat().st_size / 1024 ** 3
