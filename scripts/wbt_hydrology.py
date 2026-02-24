@@ -44,7 +44,7 @@ import config
 # CONFIG — Edit these before running
 # =============================================================================
 
-DEM_MOSAIC  = config.DATA_DEM_MOSAIC   # Input DEM mosaic
+DEM_MOSAIC  = config.DATA_DEM_MOSAIC_WBT   # Input DEM mosaic
 OUTPUT_DIR  = config.DATA_SCRATCH_WBT      # Output folder
 
 # WhiteboxTools executable — if on PATH just use "whitebox_tools"
