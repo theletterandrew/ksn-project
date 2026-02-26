@@ -5,6 +5,7 @@ dependencies:
   - python=3.11
   - gdal
   - scipy
+  - scikit-image
   - laspy
   - lazrs-python
   - numpy
