@@ -2,17 +2,25 @@
 stream_extraction_wbt.py
 ------------------------
 Extracts a fully connected stream network from WhiteboxTools flow
-accumulation output. Uses arcpy's Stream to Feature tool to convert
-the thresholded stream raster to vector polylines.
+accumulation output. Converts the thresholded stream raster to vector
+polylines using open-source Python GIS libraries (no arcpy required).
 
 USAGE:
-    1. Edit the paths and threshold in the CONFIG section below.
-    2. Run from the ArcGIS Pro Python environment:
-       conda activate arcgispro-py3
+    1. Install dependencies:
+       pip install rasterio numpy scipy scikit-image fiona shapely
+
+    2. Edit the paths and threshold in the CONFIG section below.
+
+    3. Run:
        python stream_extraction_wbt.py
 
 Requirements:
-    - ArcGIS Pro with Spatial Analyst extension
+    - rasterio
+    - numpy
+    - scipy
+    - scikit-image
+    - fiona
+    - shapely
     - Completed wbt_hydrology.py first
 """
 
@@ -21,8 +29,15 @@ import sys
 import time
 from pathlib import Path
 
-import arcpy
-from arcpy.sa import Con, Raster, Int
+import numpy as np
+import rasterio
+from rasterio.transform import from_bounds
+import fiona
+from fiona.crs import from_epsg
+from shapely.geometry import mapping, LineString, MultiLineString
+from shapely.ops import unary_union
+from scipy import ndimage
+from skimage.morphology import skeletonize
 
 # Calculate the path to the project root (one level up from scripts/)
 root_dir = Path(__file__).resolve().parent.parent
@@ -73,6 +88,107 @@ def setup_logging(output_dir: Path) -> logging.Logger:
     return logging.getLogger(__name__)
 
 
+def pixel_to_coord(row, col, transform):
+    """Convert raster pixel (row, col) to real-world (x, y) coordinates."""
+    x, y = rasterio.transform.xy(transform, row, col)
+    return x, y
+
+
+def trace_stream_segments(stream_mask, transform):
+    """
+    Trace connected stream pixels into polyline segments.
+
+    Strategy:
+      1. Skeletonize the binary stream mask to single-pixel-wide lines.
+      2. Label connected components.
+      3. For each component, order the pixels along the path and build
+         a LineString from their real-world coordinates.
+
+    Returns a list of Shapely LineString geometries.
+    """
+    # Skeletonize to ensure single-pixel-wide centerlines
+    skeleton = skeletonize(stream_mask)
+
+    # Label 8-connected components
+    struct = ndimage.generate_binary_structure(2, 2)  # 8-connectivity
+    labeled, num_features = ndimage.label(skeleton, structure=struct)
+
+    lines = []
+
+    for label_id in range(1, num_features + 1):
+        component = np.argwhere(labeled == label_id)
+
+        if len(component) < 2:
+            # Single isolated pixel — skip (can't form a line)
+            continue
+
+        if len(component) == 2:
+            # Exactly two pixels — simple segment
+            coords = [pixel_to_coord(r, c, transform) for r, c in component]
+            lines.append(LineString(coords))
+            continue
+
+        # Order pixels by traversal from one endpoint to the other.
+        # An endpoint is a pixel with exactly one neighbour in the skeleton.
+        ordered = _order_pixels(component, skeleton)
+        if ordered is None or len(ordered) < 2:
+            continue
+
+        coords = [pixel_to_coord(r, c, transform) for r, c in ordered]
+        lines.append(LineString(coords))
+
+    return lines
+
+
+def _order_pixels(pixels, skeleton):
+    """
+    Order an array of (row, col) pixels from one end of a skeleton branch
+    to the other using a greedy nearest-neighbour walk starting from an
+    endpoint (degree-1 pixel).
+    """
+    pixel_set = {(r, c) for r, c in pixels}
+
+    # Find endpoints: pixels with only one 8-connected neighbour in the set
+    def degree(r, c):
+        count = 0
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if (dr, dc) == (0, 0):
+                    continue
+                if (r + dr, c + dc) in pixel_set:
+                    count += 1
+        return count
+
+    endpoints = [(r, c) for r, c in pixel_set if degree(r, c) == 1]
+
+    # Start from an endpoint if available, otherwise any pixel
+    start = endpoints[0] if endpoints else pixels[0].tolist()
+
+    visited = []
+    current = tuple(start)
+    seen = set()
+
+    while current in pixel_set and current not in seen:
+        visited.append(current)
+        seen.add(current)
+
+        r, c = current
+        neighbours = [
+            (r + dr, c + dc)
+            for dr in (-1, 0, 1)
+            for dc in (-1, 0, 1)
+            if (dr, dc) != (0, 0)
+            and (r + dr, c + dc) in pixel_set
+            and (r + dr, c + dc) not in seen
+        ]
+
+        if not neighbours:
+            break
+        current = neighbours[0]
+
+    return visited if len(visited) >= 2 else None
+
+
 def main():
     wbt_dir    = Path(WBT_DIR)
     output_dir = Path(OUTPUT_DIR)
@@ -94,78 +210,88 @@ def main():
         logger.error("Run wbt_hydrology.py first.")
         sys.exit(1)
 
-    # Check Spatial Analyst license
-    if arcpy.CheckExtension("Spatial") == "Available":
-        arcpy.CheckOutExtension("Spatial")
-        logger.info("Spatial Analyst extension checked out.")
-    else:
-        logger.error("Spatial Analyst extension not available. Exiting.")
-        sys.exit(1)
-
-    arcpy.env.overwriteOutput = True
-    arcpy.env.workspace       = str(output_dir)
-
     logger.info(f"Threshold: {THRESHOLD:,} cells (~{THRESHOLD * 4 / 1e6:.1f} km² at 2m)")
     logger.info("-" * 60)
 
     start_time = time.time()
 
     try:
-        # --- Step 1: Apply threshold to create binary stream raster ---
+        # --- Step 1: Read flow accumulation and apply threshold ---
+        logger.info("Reading flow accumulation raster...")
+        with rasterio.open(str(fac_path)) as fac_ds:
+            fac_data  = fac_ds.read(1).astype(np.float64)
+            transform = fac_ds.transform
+            crs       = fac_ds.crs
+            nodata    = fac_ds.nodata
+
+        # Mask nodata pixels before thresholding
+        if nodata is not None:
+            valid_mask = fac_data != nodata
+        else:
+            valid_mask = np.ones_like(fac_data, dtype=bool)
+
         logger.info("Applying threshold to flow accumulation...")
-        fac_raster    = Raster(str(fac_path))
-        stream_raster = Con(fac_raster >= THRESHOLD, 1)
+        stream_mask = (fac_data >= THRESHOLD) & valid_mask
+        logger.info(f"  Stream pixels above threshold: {stream_mask.sum():,}")
 
-        temp_stream = str(output_dir / "tmp_stream_raster.tif")
-        stream_raster.save(temp_stream)
-        logger.info("Stream raster created.")
+        if stream_mask.sum() == 0:
+            logger.error("No stream pixels found at this threshold. "
+                         "Lower THRESHOLD or check input data.")
+            sys.exit(1)
 
-        # --- Step 2: Convert WBT flow direction to integer (required by StreamToFeature) ---
-        # WhiteboxTools D8Pointer outputs float, but arcpy requires integer
-        logger.info("Converting flow direction to integer...")
-        fdr_int  = Int(Raster(str(fdr_path)))
-        temp_fdr = str(output_dir / "tmp_fdr_int.tif")
-        fdr_int.save(temp_fdr)
-        logger.info("Flow direction integer raster created.")
+        # --- Step 2: Trace stream pixels into vector polylines ---
+        logger.info("Tracing stream network into polylines...")
+        logger.info("  (This may take several minutes for large study areas)")
 
-        # --- Step 3: Convert to vector polylines ---
-        logger.info("Converting stream raster to vector polylines...")
-        logger.info("(This may take several minutes for the full study area)")
+        lines = trace_stream_segments(stream_mask, transform)
+        logger.info(f"  Polyline segments created: {len(lines):,}")
 
-        arcpy.sa.StreamToFeature(
-            in_stream_raster         = temp_stream,
-            in_flow_direction_raster = temp_fdr,
-            out_polyline_features    = str(out_shp),
-            simplify                 = "SIMPLIFY"
-        )
+        if not lines:
+            logger.error("No polyline segments were created. "
+                         "Check input data and threshold.")
+            sys.exit(1)
 
-        # Clean up temp rasters
-        arcpy.management.Delete(temp_stream)
-        arcpy.management.Delete(temp_fdr)
-        logger.info("Temporary rasters deleted.")
+        # --- Step 3: Write to shapefile ---
+        logger.info(f"Writing output shapefile: {out_shp}")
 
-        if not out_shp.exists():
-            raise RuntimeError("Output shapefile was not created.")
+        schema = {
+            "geometry": "LineString",
+            "properties": {"seg_id": "int"}
+        }
 
-        # Report statistics
-        result = arcpy.management.GetCount(str(out_shp))
-        count  = int(result.getOutput(0))
+        # Use the raster CRS for the output; fall back to EPSG:4326 if absent
+        if crs is not None:
+            out_crs = crs.to_dict()
+        else:
+            logger.warning("No CRS found in flow accumulation raster. "
+                           "Output will have no projection.")
+            out_crs = {}
+
+        with fiona.open(
+            str(out_shp),
+            mode="w",
+            driver="ESRI Shapefile",
+            schema=schema,
+            crs=out_crs
+        ) as dst:
+            for i, line in enumerate(lines, start=1):
+                dst.write({
+                    "geometry": mapping(line),
+                    "properties": {"seg_id": i}
+                })
 
         elapsed = time.time() - start_time
         logger.info("=" * 60)
         logger.info("COMPLETE")
         logger.info(f"  Output        : {out_shp}")
-        logger.info(f"  Stream count  : {count:,} segments")
+        logger.info(f"  Stream count  : {len(lines):,} segments")
         logger.info(f"  Total time    : {elapsed / 60:.1f} minutes")
         logger.info("")
-        logger.info("Load streams_connected.shp in ArcGIS Pro to verify the network.")
+        logger.info("Load streams_connected.shp in ArcGIS Pro or QGIS to verify.")
 
     except Exception as e:
-        logger.error(f"FAILED: {e}")
-        arcpy.CheckInExtension("Spatial")
+        logger.error(f"FAILED: {e}", exc_info=True)
         sys.exit(1)
-
-    arcpy.CheckInExtension("Spatial")
 
 
 if __name__ == "__main__":

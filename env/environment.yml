@@ -15,5 +15,6 @@ dependencies:
   - whitebox
   - geopandas
   - matplotlib
+  - fiona
   - pip:
       - python-dotenv
