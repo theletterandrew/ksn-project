@@ -8,13 +8,19 @@ For each watershed polygon, extracts the corresponding DEM extent and saves
 it as a separate GeoTIFF file named by the watershed ID.
 
 USAGE:
-    1. Edit the paths in the CONFIG section below.
-    2. Run from the ArcGIS Pro Python environment:
-       conda activate arcgispro-py3
+    1. Install dependencies:
+       pip install rasterio fiona shapely numpy
+
+    2. Edit the paths in the CONFIG section below.
+
+    3. Run:
        python clip_watersheds.py
 
 Requirements:
-    - ArcGIS Pro with Spatial Analyst extension
+    - rasterio
+    - fiona
+    - shapely
+    - numpy
     - Completed delineate_watersheds.py first
 """
 
@@ -23,8 +29,11 @@ import sys
 import time
 from pathlib import Path
 
-import arcpy
-from arcpy.sa import ExtractByMask
+import fiona
+import numpy as np
+import rasterio
+import rasterio.mask
+from shapely.geometry import shape
 
 # Calculate the path to the project root (one level up from scripts/)
 root_dir = Path(__file__).resolve().parent.parent
@@ -39,9 +48,9 @@ import config
 # CONFIG — Edit these before running
 # =============================================================================
 
-DEM_MOSAIC      = config.DATA_DEM_MOSAIC / "dem_mosaic.tif"     # Full DEM mosaic
-WATERSHEDS_SHP  = config.DATA_SCRATCH_WATERSHEDS / "watersheds.shp"      # Watershed polygons
-OUTPUT_DIR      = config.DATA_WATERSHEDS                 # Output folder for clipped DEMs
+DEM_MOSAIC      = config.DATA_DEM_MOSAIC / "dem_mosaic.tif"          # Full DEM mosaic
+WATERSHEDS_SHP  = config.DATA_SCRATCH_WATERSHEDS / "watersheds.shp"  # Watershed polygons
+OUTPUT_DIR      = config.DATA_WATERSHEDS                              # Output folder for clipped DEMs
 
 # Field in watersheds.shp that contains unique watershed IDs
 # The script will use this to name output files
@@ -66,31 +75,52 @@ def setup_logging(output_dir: Path) -> logging.Logger:
     return logging.getLogger(__name__)
 
 
-def clip_watershed(dem_path: str, watershed_geom, watershed_id: int,
-                   output_dir: Path, logger: logging.Logger) -> tuple[bool, str]:
+def clip_watershed(
+    dem_ds: rasterio.DatasetReader,
+    geom: dict,
+    watershed_id: int,
+    output_dir: Path,
+    logger: logging.Logger,
+) -> tuple[bool, str]:
     """
-    Clips the DEM to a single watershed polygon.
+    Clips the DEM to a single watershed polygon geometry (GeoJSON-like dict).
     Returns (success, output_path).
     """
     out_path = output_dir / f"watershed_{watershed_id}.tif"
 
-    # Skip if already exists
     if out_path.exists():
         return (True, str(out_path))
 
     try:
-        # Use ExtractByMask to clip DEM to watershed polygon
-        clipped = ExtractByMask(dem_path, watershed_geom)
-        clipped.save(str(out_path))
+        # rasterio.mask.mask expects a list of geometry dicts
+        clipped_data, clipped_transform = rasterio.mask.mask(
+            dem_ds,
+            [geom],
+            crop=True,        # Crop to the bounding box of the geometry
+            filled=True,      # Fill nodata outside the mask
+            nodata=dem_ds.nodata if dem_ds.nodata is not None else np.nan,
+        )
 
-        size_mb = out_path.stat().st_size / 1024 / 1024
+        out_meta = dem_ds.meta.copy()
+        out_meta.update({
+            "driver":    "GTiff",
+            "height":    clipped_data.shape[1],
+            "width":     clipped_data.shape[2],
+            "transform": clipped_transform,
+            "compress":  "lzw",
+            "tiled":     True,
+        })
+
+        with rasterio.open(str(out_path), "w", **out_meta) as dst:
+            dst.write(clipped_data)
+
         return (True, str(out_path))
 
     except Exception as e:
         logger.error(f"  Failed to clip watershed {watershed_id}: {e}")
         if out_path.exists():
             try:
-                arcpy.management.Delete(str(out_path))
+                out_path.unlink()
             except Exception:
                 pass
         return (False, "")
@@ -113,19 +143,25 @@ def main():
         logger.error("Run delineate_watersheds.py first.")
         sys.exit(1)
 
-    # Check Spatial Analyst license
-    if arcpy.CheckExtension("Spatial") == "Available":
-        arcpy.CheckOutExtension("Spatial")
-        logger.info("Spatial Analyst extension checked out.")
-    else:
-        logger.error("Spatial Analyst extension not available. Exiting.")
-        sys.exit(1)
+    # Load watershed features
+    with fiona.open(str(watersheds_shp)) as shp:
+        # Check that the ID field exists
+        if ID_FIELD not in shp.schema["properties"]:
+            available = list(shp.schema["properties"].keys())
+            logger.error(
+                f"ID_FIELD '{ID_FIELD}' not found in shapefile. "
+                f"Available fields: {available}"
+            )
+            sys.exit(1)
 
-    arcpy.env.overwriteOutput = True
-    arcpy.env.workspace       = str(output_dir)
+        # Read CRS for reprojection check later
+        shp_crs = shp.crs
+        features = [
+            (feat["geometry"], feat["properties"][ID_FIELD])
+            for feat in shp
+        ]
 
-    # Count watersheds
-    total = int(arcpy.management.GetCount(str(watersheds_shp))[0])
+    total = len(features)
     logger.info(f"Found {total} watersheds")
     logger.info(f"DEM mosaic : {dem_path}")
     logger.info(f"Output dir : {output_dir}")
@@ -136,9 +172,18 @@ def main():
     failed     = 0
     skipped    = 0
 
-    # Process each watershed
-    with arcpy.da.SearchCursor(str(watersheds_shp), ["SHAPE@", ID_FIELD]) as cursor:
-        for i, (geom, wid) in enumerate(cursor, start=1):
+    # Open the DEM once and reuse across all clips for efficiency
+    with rasterio.open(str(dem_path)) as dem_ds:
+
+        # Warn if CRS mismatch between shapefile and DEM
+        if shp_crs and dem_ds.crs and shp_crs != dem_ds.crs:
+            logger.warning(
+                f"CRS mismatch: shapefile={shp_crs}, DEM={dem_ds.crs}. "
+                "Geometries will be used as-is; reproject your shapefile if "
+                "results look incorrect."
+            )
+
+        for i, (geom, wid) in enumerate(features, start=1):
             out_path = output_dir / f"watershed_{wid}.tif"
 
             if out_path.exists():
@@ -150,7 +195,7 @@ def main():
             tile_start = time.time()
 
             success, result_path = clip_watershed(
-                str(dem_path), geom, wid, output_dir, logger
+                dem_ds, geom, wid, output_dir, logger
             )
 
             if success:
@@ -171,8 +216,6 @@ def main():
             else:
                 failed += 1
                 logger.error(f"[{i:3d}/{total}] FAIL  Watershed {wid}")
-
-    arcpy.CheckInExtension("Spatial")
 
     elapsed_total = time.time() - start_time
     logger.info("=" * 60)
