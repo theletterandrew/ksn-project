@@ -58,7 +58,7 @@ SCRIPTS_TO_RUN = [
     ("inspect_las.py",             KSNENV_PYTHON),
     ("delete_empty_files.py",      KSNENV_PYTHON),
     ("las_to_dem.py",              KSNENV_PYTHON),
-    ("mosaic_dem.py",              ARCGIS_PYTHON),
+    ("mosaic_dem.py",              KSNENV_PYTHON),
     ("wbt_hydrology.py",           KSNENV_PYTHON),
     ("stream_extraction_wbt.py",   ARCGIS_PYTHON),
     ("delineate_watersheds.py",    KSNENV_PYTHON),
