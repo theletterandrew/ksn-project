@@ -2,7 +2,7 @@ import subprocess
 import sys
 import time
 import os
-from pathlib import Path
+
 
 def sanitize_env():
     """Return a copy of the environment safe for running ksn_env scripts."""
@@ -26,40 +26,29 @@ def sanitize_env():
 
     return env
 
-def find_ksn_python():
-    """Find the ksn_env Python executable via conda."""
-    result = subprocess.run(
-        ["conda", "run", "-n", "ksn_env", "python", "-c", "import sys; print(sys.executable)"],
-        capture_output=True, text=True
-    )
-    if result.returncode == 0:
-        return result.stdout.strip()
-    raise EnvironmentError("Could not locate ksn_env. Has it been created yet?")
-
-KSNENV_PYTHON = find_ksn_python()
 
 SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
 
-
 SCRIPTS_TO_RUN = [
-    ("batchdownload.py",           KSNENV_PYTHON),
-    ("laz_to_las.py",              KSNENV_PYTHON),
-    ("inspect_las.py",             KSNENV_PYTHON),
-    ("delete_empty_files.py",      KSNENV_PYTHON),
-    ("las_to_dem.py",              KSNENV_PYTHON),
-    ("mosaic_dem.py",              KSNENV_PYTHON),
-    ("wbt_hydrology.py",           KSNENV_PYTHON),
-    ("stream_extraction_wbt.py",   KSNENV_PYTHON),
-    ("delineate_watersheds.py",    KSNENV_PYTHON),
-    ("clip_watersheds.py",         KSNENV_PYTHON),
-    ("calculate_ksn.py",           KSNENV_PYTHON),
-    ("plot_stream_profiles.py",    KSNENV_PYTHON),
+    "batchdownload.py",
+    "laz_to_las.py",
+    "inspect_las.py",
+    "delete_empty_files.py",
+    "las_to_dem.py",
+    "mosaic_dem.py",
+    "wbt_hydrology.py",
+    "stream_extraction_wbt.py",
+    "delineate_watersheds.py",
+    "clip_watersheds.py",
+    "calculate_ksn.py",
+    "plot_stream_profiles.py",
 ]
 
-def run_script(script_name, python_exec):
+
+def run_script(script_name: str, env: dict) -> bool:
     print(f"\n{'='*40}")
     print(f"RUNNING: {script_name}")
-    print(f"PYTHON:  {python_exec}")
+    print(f"PYTHON:  {sys.executable}")
     print(f"{'='*40}")
 
     script_path = os.path.join(SCRIPTS_DIR, script_name)
@@ -67,19 +56,15 @@ def run_script(script_name, python_exec):
     if not os.path.exists(script_path):
         print(f"ERROR: Script not found at expected path: {script_path}")
         return False
-    
-    if not os.path.exists(python_exec):
-        print(f"ERROR: Python executable not found: {python_exec}")
-        return False
 
     start_time = time.time()
 
     try:
         subprocess.run(
-            [python_exec, script_path],
+            [sys.executable, script_path],
             check=True,
             cwd=os.path.dirname(os.path.abspath(__file__)),
-            env=CLEAN_ENV
+            env=env,
         )
         duration = time.time() - start_time
         print(f"SUCCESS: {script_name} finished in {duration:.2f} seconds.")
@@ -89,17 +74,28 @@ def run_script(script_name, python_exec):
         print(f"ERROR: {script_name} failed with exit code {e.returncode}")
         return False
 
-CLEAN_ENV = sanitize_env()
 
 def main():
+    # Verify we're running inside ksn_env
+    active_env = os.environ.get("CONDA_DEFAULT_ENV", "")
+    if active_env != "ksn_env":
+        print(f"WARNING: Expected to be running in 'ksn_env', but active env is '{active_env or '(none)'}'.")
+        print("Activate it first with:  conda activate ksn_env")
+        print("Continuing anyway...\n")
+
+    clean_env = sanitize_env()
+
+    print(f"Python:           {sys.executable}")
     print(f"Scripts directory: {SCRIPTS_DIR}")
-    for script, python_exec in SCRIPTS_TO_RUN:
-        success = run_script(script, python_exec)
+
+    for script in SCRIPTS_TO_RUN:
+        success = run_script(script, clean_env)
         if not success:
             print("\nPIPELINE HALTED: A critical error occurred.")
-            break
-    else:
-        print("\nALL SCRIPTS COMPLETED SUCCESSFULLY!")
+            sys.exit(1)
+
+    print("\nALL SCRIPTS COMPLETED SUCCESSFULLY!")
+
 
 if __name__ == "__main__":
     main()
