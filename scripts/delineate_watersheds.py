@@ -20,7 +20,7 @@ Requirements:
     - numpy       (pip install numpy)
     - WhiteboxTools executable on PATH or configured via config.WBT_EXE
     - Completed wbt_hydrology.py and stream_extraction_wbt.py first
-    - NO ArcGIS / Spatial Analyst license required
+    - streams_connected.gpkg produced by stream_extraction_wbt.py
 """
 
 import logging
@@ -49,7 +49,7 @@ import config
 # =============================================================================
 
 WBT_DIR     = config.DATA_SCRATCH_WBT
-STREAMS_SHP = config.DATA_STREAMS / "streams_connected.shp"
+STREAMS_SHP = config.DATA_STREAMS / "streams_connected.gpkg"
 OUTPUT_DIR  = config.DATA_SCRATCH_WATERSHEDS
 WBT_EXE     = config.WBT_EXE
 
@@ -116,14 +116,21 @@ def setup_logging(output_dir: Path) -> logging.Logger:
     return logging.getLogger(__name__)
 
 
-def extract_stream_endpoints(streams_shp: Path) -> gpd.GeoDataFrame:
-    """Return a GeoDataFrame containing the end-vertex of every stream line."""
-    streams = gpd.read_file(streams_shp)
-    end_geoms = streams.geometry.apply(
-        lambda geom: gpd.points_from_xy(
-            [geom.coords[-1][0]], [geom.coords[-1][1]]
-        )[0]
-    )
+def extract_stream_endpoints(streams_gpkg: Path) -> gpd.GeoDataFrame:
+    """
+    Return a GeoDataFrame of outlet points from the stream network GeoPackage.
+
+    The stream network produced by stream_extraction_wbt.py contains Polygon
+    geometries (stream corridor footprints). We derive outlet points by taking
+    the centroid of each polygon, then keeping only the one with the highest
+    flow accumulation value (sampled in the next step).
+    """
+    streams = gpd.read_file(streams_gpkg, layer="streams")
+
+    # Derive a representative point from each geometry.
+    # centroid works for both Polygon and LineString inputs.
+    end_geoms = streams.geometry.centroid
+
     return gpd.GeoDataFrame(geometry=end_geoms, crs=streams.crs).reset_index(drop=True)
 
 
@@ -379,7 +386,7 @@ def main():
     if endpoints.empty:
         logger.error(
             "No stream endpoints overlapped the FAC raster. "
-            "Confirm that streams_connected.shp and flow_accumulation.tif "
+            "Confirm that streams_connected.gpkg and flow_accumulation.tif "
             "share the same CRS and cover the same area."
         )
         sys.exit(1)
