@@ -62,7 +62,7 @@ SCRIPTS_TO_RUN = [
     ("wbt_hydrology.py",           KSNENV_PYTHON),
     ("stream_extraction_wbt.py",   KSNENV_PYTHON),
     ("delineate_watersheds.py",    KSNENV_PYTHON),
-    ("clip_watersheds.py",         ARCGIS_PYTHON),
+    ("clip_watersheds.py",         KSNENV_PYTHON),
     ("calculate_ksn.py",           KSNENV_PYTHON),
     ("plot_stream_profiles.py",    KSNENV_PYTHON),
 ]
