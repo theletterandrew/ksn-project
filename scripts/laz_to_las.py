@@ -149,7 +149,7 @@ def main():
                 status = "FAIL"
 
             elapsed = time.time() - start_time
-            rate    = i / elapsed
+            rate    = i / elapsed if elapsed > 0 else 0
             eta_min = (total - i) / rate / 60 if rate > 0 else 0
 
             logger.info(
