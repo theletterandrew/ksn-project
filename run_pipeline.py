@@ -36,18 +36,7 @@ def find_ksn_python():
         return result.stdout.strip()
     raise EnvironmentError("Could not locate ksn_env. Has it been created yet?")
 
-def find_arcgis_python():
-    """Find arcgispro-py3 Python executable by querying conda directly."""
-    result = subprocess.run(
-        ["conda", "run", "-n", "arcgispro-py3", "python", "-c", "import sys; print(sys.executable)"],
-        capture_output=True, text=True
-    )
-    if result.returncode == 0:
-        return result.stdout.strip()
-    raise EnvironmentError("Could not locate arcgispro-py3. Is ArcGIS Pro installed?")
-
 KSNENV_PYTHON = find_ksn_python()
-ARCGIS_PYTHON = find_arcgis_python()
 
 SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
 
