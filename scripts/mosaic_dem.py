@@ -122,7 +122,7 @@ def main():
         # Step 2: Translate VRT → single GeoTIFF mosaic.
         # Using LZW compression and tiling for efficient storage/access.
         # ------------------------------------------------------------------
-        logger.info("Translating VRT → GeoTIFF mosaic (this may take a while)...")
+        logger.info("Translating VRT -> GeoTIFF mosaic (this may take a while)...")
         translate_options = gdal.TranslateOptions(
             format="GTiff",
             outputType=gdal.GDT_Float32,
