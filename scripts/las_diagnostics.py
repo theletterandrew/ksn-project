@@ -273,6 +273,7 @@ def main():
             "Ground density is low. Consider using USGS 3DEP 10m data as a base layer, "
             "or lower STREAM_THRESHOLD to match resolution."
         )
+    input("las_diagnostics.py complete — press Enter to continue...")
 
 
 if __name__ == "__main__":
