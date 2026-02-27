@@ -435,7 +435,15 @@ def snap_pour_points_wbt(
 
     # Burn snapped vector points to a raster aligned with the FAC grid
     snapped_gdf = gpd.read_file(str(snapped_shp))
+    if snapped_gdf.empty:
+        logger.warning(
+            "  SnapPourPoints produced an empty shapefile — "
+            "falling back to original (unsnapped) pour points."
+        )
+        snapped_gdf = gpd.read_file(str(temp_shp))
+
     snapped_gdf["POUR_ID"] = range(1, len(snapped_gdf) + 1)
+    logger.info(f"  Burning {len(snapped_gdf)} snapped pour point(s) to raster...")
     _points_to_raster(snapped_gdf, "POUR_ID", fac_path, snapped_tif)
     logger.info(f"  Snapped pour point raster written: {snapped_tif.name}")
 
@@ -734,6 +742,66 @@ def main():
     if DEBUG_POUR_POINTS:
         logger.info("DEBUG: Inspecting FDR values at snapped pour point(s)...")
         debug_pour_points(snapped_tif, fdr_path, logger)
+
+    # ------------------------------------------------------------------
+    # Validate snapped raster before calling WBT Watershed.
+    # WBT hangs silently when the pour point raster has no cells that
+    # overlap valid FDR data — catch this early with a clear error.
+    # ------------------------------------------------------------------
+    logger.info("  Validating snapped pour point raster...")
+    with rasterio.open(snapped_tif) as _pp_src:
+        _pp_arr    = _pp_src.read(1)
+        _pp_nd     = _pp_src.nodata
+        _pp_trans  = _pp_src.transform
+        _pp_bounds = _pp_src.bounds
+
+    _valid_pp = (_pp_arr != _pp_nd) if _pp_nd is not None else (_pp_arr > 0)
+    _n_pp_cells = int(_valid_pp.sum())
+    logger.info(f"  Pour point raster: {_n_pp_cells} valid cell(s)")
+
+    if _n_pp_cells == 0:
+        logger.error(
+            "Snapped pour point raster is empty — no cells were burned. "
+            "The pour point may lie outside the FAC raster extent. "
+            "Check that find_outlets_from_fac returned coordinates inside "
+            "the raster bounds."
+        )
+        sys.exit(1)
+
+    # Check that the pour point cells overlap the FDR raster extent
+    with rasterio.open(fdr_path) as _fdr_src:
+        _fdr_bounds = _fdr_src.bounds
+        _fdr_arr    = _fdr_src.read(1)
+        _fdr_nd     = _fdr_src.nodata
+
+    _pp_rows, _pp_cols = np.where(_valid_pp)
+    _overlap_ok = False
+    for _r, _c in zip(_pp_rows, _pp_cols):
+        _x, _y = _pp_trans * (_c + 0.5, _r + 0.5)
+        if (_fdr_bounds.left <= _x <= _fdr_bounds.right and
+                _fdr_bounds.bottom <= _y <= _fdr_bounds.top):
+            # Also check the FDR value at this location is not nodata
+            try:
+                with rasterio.open(fdr_path) as _fdr_src2:
+                    _fdr_val = list(_fdr_src2.sample([(_x, _y)]))[0][0]
+                if _fdr_nd is None or _fdr_val != _fdr_nd:
+                    logger.info(
+                        f"  Pour point at ({_x:.1f}, {_y:.1f}) — "
+                        f"FDR value: {_fdr_val}"
+                    )
+                    _overlap_ok = True
+                    break
+            except Exception:
+                pass
+
+    if not _overlap_ok:
+        logger.error(
+            "Pour point cell does not overlap any valid FDR cell. "
+            "WBT Watershed would hang — aborting. "
+            "Verify that flow_direction.tif and flow_accumulation.tif "
+            "cover the same area and were produced by the same WBT run."
+        )
+        sys.exit(1)
 
     # ------------------------------------------------------------------
     # Step 3 & 4: WBT watershed delineation -> vectorise -> area stats
