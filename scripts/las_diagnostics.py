@@ -57,33 +57,53 @@ def run_lasinfo(las_path: Path, logger: logging.Logger):
         tmp.unlink(missing_ok=True)
 
 def parse_lasinfo(output: str, filename: str):
-    """Parse lasinfo output into essential ground-only stats."""
+    """Parse lasinfo64 text output into a stats dict."""
     if not output:
         return None
 
-    stats = {"file": filename}
+    stats = {"file": filename, "class_breakdown": {}}
 
-    # Total points (which are all ground points in this workflow)
+    # 1. Capture Total Points from Header
     m = re.search(r"number of point records:\s+([\d,]+)", output, re.IGNORECASE)
-    total_pts = int(m.group(1).replace(",", "")) if m else 0
-    stats["ground_count"] = total_pts
+    total_points = int(m.group(1).replace(",", "")) if m else 0
+    stats["total_points"] = total_points
 
-    # Bounding box & Area
+    # 2. Capture Bounding Box
     m_min = re.search(r"min x y z:\s+([\d.\-]+)\s+([\d.\-]+)\s+([\d.\-]+)", output, re.IGNORECASE)
     m_max = re.search(r"max x y z:\s+([\d.\-]+)\s+([\d.\-]+)\s+([\d.\-]+)", output, re.IGNORECASE)
     
     if m_min and m_max:
-        area_m2 = (float(m_max.group(1)) - float(m_min.group(1))) * \
-                  (float(m_max.group(2)) - float(m_min.group(2)))
-        stats["area_m2"] = max(area_m2, 1.0)
-        stats["z_range"] = (float(m_min.group(3)), float(m_max.group(3)))
+        stats["x_min"], stats["y_min"], stats["z_min"] = map(float, m_min.groups())
+        stats["x_max"], stats["y_max"], stats["z_max"] = map(float, m_max.groups())
+        area_m2 = (stats["x_max"] - stats["x_min"]) * (stats["y_max"] - stats["y_min"])
     else:
-        stats["area_m2"] = 1.0
+        area_m2 = 1.0
+    stats["area_m2"] = max(area_m2, 1.0)
 
-    # Density & Resolution
-    stats["density"] = stats["ground_count"] / stats["area_m2"]
-    stats["rec_res"] = (TARGET_POINTS_PER_CELL / stats["density"]) ** 0.5 if stats["density"] > 0 else 99.0
+    # 3. Handle Ground Points
+    # Look for class 2 in the histogram
+    ground_count = 0
+    for line in output.splitlines():
+        m = re.match(r"\s*([\d,]+)\s+\S.*?\(2\)\s*$", line)
+        if m:
+            ground_count = int(m.group(1).replace(",", ""))
+            break
     
+    # FALLBACK: If no class 2 found in histogram, but file is large,
+    # assume all points are ground points (as per download script logic)
+    if ground_count == 0 and total_points > 0:
+        ground_count = total_points
+
+    stats["ground_count"] = ground_count
+    stats["ground_pct"] = (ground_count / total_points * 100) if total_points > 0 else 0
+    stats["density"] = ground_count / stats["area_m2"]
+    
+    # Calculate Resolution, avoiding ZeroDivision
+    if stats["density"] > 0:
+        stats["rec_res"] = (TARGET_POINTS_PER_CELL / stats["density"]) ** 0.5
+    else:
+        stats["rec_res"] = 99.0
+
     return stats
 
 def main():
