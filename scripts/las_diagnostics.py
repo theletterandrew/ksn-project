@@ -82,22 +82,34 @@ def setup_logging() -> logging.Logger:
 
 
 def run_lasinfo(las_path: Path, logger: logging.Logger):
-    """Run lasinfo64.exe on a file and return its stdout as a string."""
-    cmd = [str(LASINFO_EXE), "-i", str(las_path), "-cd", "-o", "stdout"]
+    """Run lasinfo64.exe on a file and return its report as a string.
+
+    lasinfo does not reliably write to stdout when it encounters CRS warnings,
+    so we write to a temp file and read it back instead.
+    """
+    import tempfile
+    tmp = Path(tempfile.mktemp(suffix=".txt"))
+    cmd = [str(LASINFO_EXE), "-i", str(las_path), "-cd", "-o", str(tmp)]
     try:
         result = subprocess.run(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, timeout=120,
         )
-        # LAStools prints CRS warnings for EPSG:3857 to stderr but still
-        # produces valid point/classification output. Treat any output on
-        # stdout as success; only fail if stdout is genuinely empty.
-        if result.stdout.strip():
-            if result.stderr.strip():
-                logger.warning(f"  lasinfo64 warnings for {las_path.name}: {result.stderr.strip()}")
-            return result.stdout
-        # stdout is empty — genuine failure
-        logger.error(f"  lasinfo64 failed for {las_path.name}: {result.stderr.strip()}")
+        # Suppress expected EPSG:3857 CRS warnings from LAStools stderr
+        if result.stderr.strip():
+            for line in result.stderr.strip().splitlines():
+                if "not implemented" not in line and "WARNING" not in line.upper():
+                    logger.warning(f"  lasinfo64: {line}")
+
+        if tmp.exists() and tmp.stat().st_size > 0:
+            text = tmp.read_text(errors="replace")
+            tmp.unlink(missing_ok=True)
+            return text
+
+        logger.error(
+            f"  lasinfo64 produced no output for {las_path.name}. "
+            f"stderr: {result.stderr.strip()[:200]}"
+        )
         return None
     except subprocess.TimeoutExpired:
         logger.error(f"  lasinfo64 timed out for {las_path.name}")
@@ -105,6 +117,9 @@ def run_lasinfo(las_path: Path, logger: logging.Logger):
     except FileNotFoundError:
         logger.error(f"lasinfo64.exe not found at {LASINFO_EXE}. Check config.LASTOOLS_BIN.")
         sys.exit(1)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
 
 
 def parse_lasinfo(output: str, filename: str):
@@ -279,7 +294,7 @@ def main():
             "Ground density is low. Consider using USGS 3DEP 10m data as a base layer, "
             "or lower STREAM_THRESHOLD to match resolution."
         )
-    input("Las Diagnostics.py complete (Press Enter to Continue)")
+
 
 if __name__ == "__main__":
     main()
