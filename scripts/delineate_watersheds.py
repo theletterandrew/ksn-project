@@ -161,15 +161,41 @@ def run_wbt(tool: str, args: dict, logger: logging.Logger, timeout: int = 600) -
 
 def extract_stream_endpoints(streams_gpkg: Path) -> gpd.GeoDataFrame:
     """
-    Return a GeoDataFrame of outlet points from the stream network GeoPackage.
+    Return a GeoDataFrame of candidate outlet points from the stream network
+    GeoPackage.
 
-    The stream network produced by stream_extraction_wbt.py contains Polygon
-    geometries (stream corridor footprints). We derive outlet points by taking
-    the centroid of each polygon, then keeping only the one with the highest
-    flow accumulation value (sampled in the next step).
+    For LineString / MultiLineString geometries (the typical output of
+    stream_extraction_wbt.py) we extract the true downstream endpoint of each
+    segment — i.e. the last coordinate of each line — because that is the cell
+    most likely to have a high flow-accumulation value and to sit exactly on a
+    stream cell in the WBT rasters.
+
+    For Polygon geometries (stream corridor footprints from older versions of
+    the pipeline) we fall back to the polygon centroid, which is the previous
+    behaviour.
+
+    Every candidate point is returned; the caller is responsible for filtering
+    to those that exceed the minimum drainage-area threshold.
     """
-    streams   = gpd.read_file(streams_gpkg, layer="streams")
-    end_geoms = streams.geometry.centroid
+    streams = gpd.read_file(streams_gpkg, layer="streams")
+    geom_type = streams.geometry.geom_type.iloc[0] if not streams.empty else "Unknown"
+
+    if "Line" in geom_type:
+        # Extract the last vertex of each line as the downstream outlet point.
+        # For MultiLineString we use the last vertex of the last component.
+        def _last_point(geom):
+            from shapely.geometry import MultiLineString
+            if isinstance(geom, MultiLineString):
+                coords = list(geom.geoms[-1].coords)
+            else:
+                coords = list(geom.coords)
+            return gpd.points_from_xy([coords[-1][0]], [coords[-1][1]])[0]
+
+        end_geoms = streams.geometry.apply(_last_point)
+    else:
+        # Fallback for Polygon corridor footprints
+        end_geoms = streams.geometry.centroid
+
     return gpd.GeoDataFrame(geometry=end_geoms, crs=streams.crs).reset_index(drop=True)
 
 
@@ -439,7 +465,7 @@ def main():
     # ------------------------------------------------------------------
     # Step 1: Extract stream endpoints and sample FAC values
     # ------------------------------------------------------------------
-    logger.info("Step 1: Identifying the primary stream outlet...")
+    logger.info("Step 1: Identifying all qualifying stream outlets...")
 
     endpoints = extract_stream_endpoints(streams_shp)
     endpoints = sample_raster_at_points(fac_path, endpoints, "fac_value")
@@ -458,11 +484,45 @@ def main():
         )
         sys.exit(1)
 
-    # Keep only the single outlet with the highest flow accumulation
-    primary           = endpoints.sort_values("fac_value", ascending=False).iloc[[0]].copy()
-    primary["POUR_ID"] = 1
-    primary_accum     = int(primary["fac_value"].iloc[0])
-    logger.info(f"  Primary outlet identified (Accumulation: {primary_accum:,} cells)")
+    # Keep every outlet whose flow accumulation meets the minimum drainage-area
+    # threshold — this tiles the whole DEM into sub-basins rather than
+    # delineating only the main-stem watershed.
+    primary = (
+        endpoints[endpoints["fac_value"] >= MIN_DRAINAGE_AREA_CELLS]
+        .sort_values("fac_value", ascending=False)
+        .copy()
+    )
+
+    if primary.empty:
+        logger.error(
+            f"No stream endpoints exceeded the minimum drainage-area threshold "
+            f"({MIN_DRAINAGE_AREA_CELLS:,} cells). "
+            f"Lower MIN_WATERSHED_AREA in config.py or check that the stream "
+            f"network overlaps the FAC raster."
+        )
+        sys.exit(1)
+
+    # ------------------------------------------------------------------
+    # Spatial deduplication: nearby segments of the same trunk will
+    # produce nearly-identical pour points and overlapping watersheds.
+    # Keep only the highest-FAC point within a minimum separation distance
+    # (3x the snap radius) so each tributary gets at most one outlet.
+    # ------------------------------------------------------------------
+    min_sep_m = SNAP_DISTANCE * cell_w * 3  # e.g. 50 cells * 2 m * 3 = 300 m
+    kept = []
+    for _, row in primary.iterrows():
+        pt = row.geometry
+        if all(pt.distance(k.geometry) >= min_sep_m for k in kept):
+            kept.append(row)
+
+    primary = gpd.GeoDataFrame(kept, crs=endpoints.crs).reset_index(drop=True)
+    primary["POUR_ID"] = range(1, len(primary) + 1)
+
+    logger.info(
+        f"  {len(primary)} qualifying outlet(s) identified "
+        f"(FAC >= {MIN_DRAINAGE_AREA_CELLS:,} cells, "
+        f"min separation {min_sep_m:.0f} m)"
+    )
 
     # ------------------------------------------------------------------
     # Step 2: Snap pour point with WBT SnapPourPoints, then rasterise
