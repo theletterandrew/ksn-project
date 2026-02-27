@@ -32,7 +32,6 @@ SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"
 SCRIPTS_TO_RUN = [
     "batchdownload.py",
     "laz_to_las.py",
-    "inspect_las.py",
     "las_diagnostics.py",
     # "delete_empty_files.py",
     # "las_to_dem.py",
