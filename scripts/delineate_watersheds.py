@@ -159,22 +159,20 @@ def run_wbt(tool: str, args: dict, logger: logging.Logger, timeout: int = 600) -
         return False
 
 
-def extract_stream_endpoints(streams_gpkg: Path, fac_path: Path) -> gpd.GeoDataFrame:
+def extract_stream_outlets(streams_gpkg: Path, fac_path: Path, sample_spacing_m: float = 10.0) -> gpd.GeoDataFrame:
     """
-    Return a GeoDataFrame of candidate outlet points from the stream network
-    GeoPackage.
+    Return a GeoDataFrame with one outlet point per stream segment — the point
+    along each line that has the highest FAC value.
 
-    For LineString / MultiLineString geometries (the typical output of
-    stream_extraction_wbt.py) we extract BOTH endpoints of every segment,
-    sample the FAC raster at each, and keep whichever end has the higher flow
-    accumulation value. This is robust to lines being stored in either
-    source->mouth or mouth->source order.
+    Strategy: interpolate candidate points along each line at `sample_spacing_m`
+    intervals (default every 10 m, i.e. every 5 cells at 2 m resolution), then
+    sample the FAC raster at all of them in a single vectorised pass and keep
+    the best point per segment. This is robust to:
+      - lines stored in source->mouth or mouth->source order
+      - endpoints that fall on headwater cells well away from the main trunk
+      - stream networks whose geometry does not extend all the way to the outlet
 
-    For Polygon geometries (stream corridor footprints from older pipeline
-    versions) we fall back to the polygon centroid.
-
-    Every candidate point is returned; the caller is responsible for filtering
-    to those that exceed the minimum drainage-area threshold.
+    For Polygon geometries (older pipeline) falls back to centroid.
     """
     from shapely.geometry import MultiLineString, Point
 
@@ -182,36 +180,60 @@ def extract_stream_endpoints(streams_gpkg: Path, fac_path: Path) -> gpd.GeoDataF
     geom_type = streams.geometry.geom_type.iloc[0] if not streams.empty else "Unknown"
 
     if "Line" not in geom_type:
-        # Fallback for Polygon corridor footprints
         end_geoms = streams.geometry.centroid
         return gpd.GeoDataFrame(geometry=end_geoms, crs=streams.crs).reset_index(drop=True)
 
-    # Build two candidate points per segment: first and last vertex
-    def _endpoints(geom):
-        if isinstance(geom, MultiLineString):
-            all_coords = [c for part in geom.geoms for c in part.coords]
-        else:
-            all_coords = list(geom.coords)
-        return Point(all_coords[0]), Point(all_coords[-1])
+    # ---------------------------------------------------------------
+    # Build a flat list of candidate points with a back-reference to
+    # which stream segment they came from.
+    # ---------------------------------------------------------------
+    seg_ids   = []   # which segment index each candidate belongs to
+    cand_pts  = []   # shapely Points
 
-    firsts, lasts = zip(*[_endpoints(g) for g in streams.geometry])
+    for seg_idx, geom in enumerate(streams.geometry):
+        length = geom.length
+        if length == 0:
+            # Degenerate line — just use the single coordinate
+            coords = list(geom.coords) if not isinstance(geom, MultiLineString)                      else list(geom.geoms[0].coords)
+            cand_pts.append(Point(coords[0]))
+            seg_ids.append(seg_idx)
+            continue
 
-    # Sample FAC at both ends in a single rasterio pass
+        # Interpolate at regular intervals plus both endpoints
+        n_steps   = max(1, int(length / sample_spacing_m))
+        distances = [i * length / n_steps for i in range(n_steps + 1)]
+        for d in distances:
+            pt = geom.interpolate(d)
+            cand_pts.append(pt)
+            seg_ids.append(seg_idx)
+
+    # ---------------------------------------------------------------
+    # Sample FAC at all candidate points in a single rasterio call
+    # ---------------------------------------------------------------
     with rasterio.open(fac_path) as src:
-        nodata    = src.nodata
-        fac_first = [v[0] for v in src.sample([(p.x, p.y) for p in firsts])]
-        fac_last  = [v[0] for v in src.sample([(p.x, p.y) for p in lasts])]
+        nodata   = src.nodata
+        fac_vals = [v[0] for v in src.sample([(p.x, p.y) for p in cand_pts])]
 
-    # For each segment pick the end with the higher FAC value.
-    # If both are nodata/zero, default to the last vertex (original behaviour).
+    # ---------------------------------------------------------------
+    # For each segment keep the candidate with the highest valid FAC
+    # ---------------------------------------------------------------
+    n_segs      = len(streams)
+    best_pt     = [None]    * n_segs
+    best_fac    = [-1.0]    * n_segs
+
+    for pt, seg_idx, fval in zip(cand_pts, seg_ids, fac_vals):
+        if nodata is not None and fval == nodata:
+            continue
+        if fval > best_fac[seg_idx]:
+            best_fac[seg_idx]  = fval
+            best_pt[seg_idx]   = pt
+
+    # Fall back to midpoint for any segment that got no valid sample
     chosen = []
-    for f_pt, l_pt, f_val, l_val in zip(firsts, lasts, fac_first, fac_last):
-        f_ok = (nodata is None or f_val != nodata) and f_val > 0
-        l_ok = (nodata is None or l_val != nodata) and l_val > 0
-        if f_ok and (not l_ok or f_val > l_val):
-            chosen.append(f_pt)
-        else:
-            chosen.append(l_pt)
+    for seg_idx, (pt, geom) in enumerate(zip(best_pt, streams.geometry)):
+        if pt is None:
+            pt = geom.interpolate(0.5, normalized=True)
+        chosen.append(pt)
 
     return gpd.GeoDataFrame(geometry=chosen, crs=streams.crs).reset_index(drop=True)
 
@@ -543,7 +565,7 @@ def main():
         fac_bounds = src.bounds
         fac_nodata = src.nodata
 
-    endpoints = extract_stream_endpoints(streams_shp, fac_path)
+    endpoints = extract_stream_outlets(streams_shp, fac_path)
 
     stream_crs = endpoints.crs
     if stream_crs and fac_crs and stream_crs != fac_crs:
