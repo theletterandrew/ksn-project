@@ -75,7 +75,7 @@ SNAP_DISTANCE = config.SNAP_DISTANCE  # cells (e.g. 50 cells = 100 m at 2 m reso
 
 # Set to True to print per-cell FDR diagnostics around the snapped pour point.
 # Useful when WBT Watershed returns an empty result; disable for production runs.
-DEBUG_POUR_POINTS = False
+DEBUG_POUR_POINTS = True
 
 # =============================================================================
 # END CONFIG — No edits needed below this line
