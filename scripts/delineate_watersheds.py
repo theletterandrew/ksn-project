@@ -75,7 +75,7 @@ SNAP_DISTANCE = config.SNAP_DISTANCE  # cells (e.g. 50 cells = 100 m at 2 m reso
 
 # Set to True to print per-cell FDR diagnostics around the snapped pour point.
 # Useful when WBT Watershed returns an empty result; disable for production runs.
-DEBUG_POUR_POINTS = True
+DEBUG_POUR_POINTS = False
 
 # =============================================================================
 # END CONFIG — No edits needed below this line
@@ -96,64 +96,28 @@ def setup_logging(output_dir: Path) -> logging.Logger:
     return logging.getLogger(__name__)
 
 
-def run_wbt(tool: str, args: dict, logger: logging.Logger, timeout: int = 600) -> bool:
+def run_wbt(tool: str, args: dict, logger: logging.Logger) -> bool:
     """
     Run a WhiteboxTools command via subprocess.
-    Streams stdout/stderr in real time so progress is visible immediately.
-    Kills the process and returns False if it exceeds `timeout` seconds.
+    Returns True on success, False on failure (does not exit).
+    Callers are responsible for deciding whether to abort.
     """
     cmd = [str(WBT_EXE), f"--run={tool}"]
     for key, val in args.items():
         cmd.append(f"--{key}={val}")
     logger.info(f"  Running WBT tool: {tool}")
-    logger.info(f"  Command: {' '.join(cmd)}")
-
     try:
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+        result = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
         )
-
-        import threading
-
-        def stream_output(pipe, log_fn):
-            for line in iter(pipe.readline, ""):
-                line = line.rstrip()
-                if line:
-                    log_fn(f"    WBT: {line}")
-            pipe.close()
-
-        stdout_thread = threading.Thread(
-            target=stream_output, args=(process.stdout, logger.info), daemon=True
-        )
-        stderr_thread = threading.Thread(
-            target=stream_output, args=(process.stderr, logger.warning), daemon=True
-        )
-        stdout_thread.start()
-        stderr_thread.start()
-
-        try:
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            logger.error(
-                f"  {tool} killed after {timeout}s timeout. "
-                f"Check that pour points overlap the FDR raster and that "
-                f"the WBT executable is not prompting for input."
-            )
+        for line in result.stdout.strip().splitlines():
+            logger.info(f"    WBT: {line}")
+        for line in result.stderr.strip().splitlines():
+            logger.warning(f"    WBT ERR: {line}")
+        if result.returncode != 0:
+            logger.error(f"  {tool} failed with return code {result.returncode}")
             return False
-
-        stdout_thread.join(timeout=5)
-        stderr_thread.join(timeout=5)
-
-        if process.returncode != 0:
-            logger.error(f"  {tool} failed with return code {process.returncode}")
-            return False
-
         return True
-
     except Exception as e:
         logger.error(f"  Failed to run {tool}: {e}")
         return False
@@ -201,8 +165,8 @@ def points_to_raster(
         transform = src.transform
         arr_shape = (src.height, src.width)
 
-    meta.update(dtype=rasterio.int32, count=1, nodata=-9999)
-    out_arr = np.full(arr_shape, -9999, dtype=np.int32)
+    meta.update(dtype=rasterio.float64, count=1, nodata=-9999.0)
+    out_arr = np.full(arr_shape, -9999.0, dtype=np.float64)
 
     for _, row in points_gdf.iterrows():
         col_idx, row_idx = ~transform * (row.geometry.x, row.geometry.y)
@@ -228,9 +192,12 @@ def snap_pour_points(
     because both inputs come from the same WBT pipeline.
     """
     with rasterio.open(pour_raster_path) as src:
-        pour_arr = src.read(1).astype(np.int32)
-        nodata   = int(src.nodata) if src.nodata is not None else -9999
+        pour_arr = src.read(1).astype(np.float64)
+        nodata   = float(src.nodata) if src.nodata is not None else -9999.0
         meta     = src.meta.copy()
+
+    # Update meta to float64 — WBT Watershed hangs silently on int32 pour points
+    meta.update(dtype=rasterio.float64, nodata=-9999.0)
 
     # Use float32 for FAC — halves memory vs float64 with no precision impact
     # for the argmax comparison we do here.
@@ -241,7 +208,7 @@ def snap_pour_points(
     if fac_nd is not None:
         fac_arr[fac_arr == fac_nd] = -1.0
 
-    snapped   = np.full_like(pour_arr, nodata)
+    snapped = np.full(pour_arr.shape, -9999.0, dtype=np.float64)
     pour_rows, pour_cols = np.where(pour_arr != nodata)
 
     if len(pour_rows) == 0:
