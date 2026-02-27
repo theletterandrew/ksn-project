@@ -768,40 +768,98 @@ def main():
         )
         sys.exit(1)
 
-    # Check that the pour point cells overlap the FDR raster extent
+    # ------------------------------------------------------------------
+    # Validate FDR at pour point and relocate if FDR == 0.
+    # WBT uses 0 for flat/unresolved cells (often the raster edge row).
+    # Walk one cell inward along the steepest FAC gradient until we find
+    # a cell with a valid non-zero FDR value, then re-burn the raster.
+    # ------------------------------------------------------------------
     with rasterio.open(fdr_path) as _fdr_src:
-        _fdr_bounds = _fdr_src.bounds
-        _fdr_arr    = _fdr_src.read(1)
-        _fdr_nd     = _fdr_src.nodata
+        _fdr_bounds  = _fdr_src.bounds
+        _fdr_arr     = _fdr_src.read(1)
+        _fdr_nd      = _fdr_src.nodata
+        _fdr_trans   = _fdr_src.transform
+        _fdr_nrows, _fdr_ncols = _fdr_src.shape
+
+    with rasterio.open(fac_path) as _fac_src2:
+        _fac_arr2 = _fac_src2.read(1).astype(np.float64)
+        _fac_nd2  = _fac_src2.nodata
+        if _fac_nd2 is not None:
+            _fac_arr2[_fac_arr2 == _fac_nd2] = 0
+
+    # Valid FDR: non-nodata AND non-zero (0 = flat/sink in WBT)
+    def _fdr_valid(val):
+        if _fdr_nd is not None and val == _fdr_nd:
+            return False
+        return int(val) != 0
 
     _pp_rows, _pp_cols = np.where(_valid_pp)
-    _overlap_ok = False
-    for _r, _c in zip(_pp_rows, _pp_cols):
-        _x, _y = _pp_trans * (_c + 0.5, _r + 0.5)
-        if (_fdr_bounds.left <= _x <= _fdr_bounds.right and
-                _fdr_bounds.bottom <= _y <= _fdr_bounds.top):
-            # Also check the FDR value at this location is not nodata
-            try:
-                with rasterio.open(fdr_path) as _fdr_src2:
-                    _fdr_val = list(_fdr_src2.sample([(_x, _y)]))[0][0]
-                if _fdr_nd is None or _fdr_val != _fdr_nd:
-                    logger.info(
-                        f"  Pour point at ({_x:.1f}, {_y:.1f}) — "
-                        f"FDR value: {_fdr_val}"
-                    )
-                    _overlap_ok = True
-                    break
-            except Exception:
-                pass
+    _fixed_points = []   # (row, col, x, y, fdr_val) for each pour point
 
-    if not _overlap_ok:
-        logger.error(
-            "Pour point cell does not overlap any valid FDR cell. "
-            "WBT Watershed would hang — aborting. "
-            "Verify that flow_direction.tif and flow_accumulation.tif "
-            "cover the same area and were produced by the same WBT run."
+    for _r, _c in zip(_pp_rows, _pp_cols):
+        _x, _y   = _pp_trans * (_c + 0.5, _r + 0.5)
+        # Find this cell in the FDR grid
+        _fc, _fr = ~_fdr_trans * (_x, _y)
+        _fr, _fc = int(_fr), int(_fc)
+
+        if not (0 <= _fr < _fdr_nrows and 0 <= _fc < _fdr_ncols):
+            logger.error(f"  Pour point ({_x:.1f}, {_y:.1f}) is outside FDR extent.")
+            sys.exit(1)
+
+        _fdr_val = int(_fdr_arr[_fr, _fc])
+        if _fdr_valid(_fdr_val):
+            logger.info(
+                f"  Pour point at ({_x:.1f}, {_y:.1f}) — FDR value: {_fdr_val} ✓"
+            )
+            _fixed_points.append((_fr, _fc, _x, _y, _fdr_val))
+            continue
+
+        # FDR is 0 — search an expanding neighbourhood (up to 20 cells)
+        # for the neighbour with the highest FAC and a valid FDR.
+        logger.warning(
+            f"  Pour point at ({_x:.1f}, {_y:.1f}) has FDR=0 (flat/edge cell). "
+            f"Searching for nearest valid FDR cell..."
         )
-        sys.exit(1)
+        _best_r, _best_c, _best_fdr, _best_fac = None, None, None, -1
+        for _radius in range(1, 21):
+            for _dr in range(-_radius, _radius + 1):
+                for _dc in range(-_radius, _radius + 1):
+                    if abs(_dr) != _radius and abs(_dc) != _radius:
+                        continue   # only check the perimeter of the square
+                    _nr, _nc = _fr + _dr, _fc + _dc
+                    if not (0 <= _nr < _fdr_nrows and 0 <= _nc < _fdr_ncols):
+                        continue
+                    _nfdr = int(_fdr_arr[_nr, _nc])
+                    _nfac = float(_fac_arr2[_nr, _nc])
+                    if _fdr_valid(_nfdr) and _nfac > _best_fac:
+                        _best_r, _best_c = _nr, _nc
+                        _best_fdr, _best_fac = _nfdr, _nfac
+            if _best_r is not None:
+                break   # found a valid cell at this radius
+
+        if _best_r is None:
+            logger.error(
+                f"  Could not find a valid FDR cell within 20 cells of "
+                f"({_x:.1f}, {_y:.1f}). Aborting."
+            )
+            sys.exit(1)
+
+        _nx, _ny = _fdr_trans * (_best_c + 0.5, _best_r + 0.5)
+        logger.info(
+            f"  Relocated pour point from ({_x:.1f}, {_y:.1f}) FDR=0 "
+            f"-> ({_nx:.1f}, {_ny:.1f}) FDR={_best_fdr} FAC={_best_fac:,.0f}"
+        )
+        _fixed_points.append((_best_r, _best_c, _nx, _ny, _best_fdr))
+
+    # Re-burn the (possibly relocated) pour points to the snapped raster
+    from shapely.geometry import Point as _ShapelyPoint
+    _fixed_gdf = gpd.GeoDataFrame(
+        {"POUR_ID": range(1, len(_fixed_points) + 1)},
+        geometry=[_ShapelyPoint(_x, _y) for _, _, _x, _y, _ in _fixed_points],
+        crs=primary.crs,
+    )
+    _points_to_raster(_fixed_gdf, "POUR_ID", fac_path, snapped_tif)
+    logger.info(f"  Pour point raster finalised with {len(_fixed_gdf)} valid cell(s)")
 
     # ------------------------------------------------------------------
     # Step 3 & 4: WBT watershed delineation -> vectorise -> area stats
