@@ -103,7 +103,10 @@ def run_lasinfo(las_path: Path, logger: logging.Logger):
 
         if tmp.exists() and tmp.stat().st_size > 0:
             text = tmp.read_text(errors="replace")
-            tmp.unlink(missing_ok=True)
+            # DEBUG: print first 3000 chars of raw lasinfo output
+            print("--- RAW LASINFO (first 3000 chars) ---")
+            print(text[:3000])
+            print("--- END RAW ---")
             return text
 
         logger.error(
@@ -147,16 +150,15 @@ def parse_lasinfo(output: str, filename: str):
 
     # Classification histogram block
     # lasinfo prints lines like:   4561234  ground (2)
-    class_block = re.search(
-        r"classification histogram.*?(?=\n\s*\n|\Z)", output, re.IGNORECASE | re.DOTALL
-    )
-    if class_block:
-        for line in class_block.group(0).splitlines()[1:]:
-            m = re.match(r"\s*([\d,]+)\s+\S.*?\((\d+)\)", line)
-            if m:
-                code  = int(m.group(2))
-                count = int(m.group(1).replace(",", ""))
-                stats["class_breakdown"][code] = stats["class_breakdown"].get(code, 0) + count
+    # Classification histogram — lasinfo uses several formats across versions.
+    # Scan every line in the output for the pattern "  COUNT  label (CODE)"
+    # which is robust to any header wording differences.
+    for line in output.splitlines():
+        m = re.match(r"\s*([\d,]+)\s+\S.*?\((\d+)\)\s*$", line)
+        if m:
+            code  = int(m.group(2))
+            count = int(m.group(1).replace(",", ""))
+            stats["class_breakdown"][code] = stats["class_breakdown"].get(code, 0) + count
 
     # Derived stats
     x_range = stats.get("x_max", 0) - stats.get("x_min", 0)
