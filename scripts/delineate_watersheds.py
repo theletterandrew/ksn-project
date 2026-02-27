@@ -525,19 +525,20 @@ def debug_pour_points(snapped_tif: Path, fdr_path: Path, logger: logging.Logger)
 
 def delineate_and_vectorise(
     fdr_path: Path,
-    pour_raster_path: Path,
+    pour_shp_path: Path,
     watersheds_tif: Path,
     watersheds_shp: Path,
     logger: logging.Logger,
 ) -> gpd.GeoDataFrame:
     """
-    Run WBT watershed delineation, vectorise the result with rasterio, and
-    return a GeoDataFrame with area_km2 attached.
+    Run WBT watershed delineation using a vector shapefile for pour points
+    (more reliable than a raster across WBT versions), vectorise the result
+    with rasterio, and return a GeoDataFrame with area_km2 attached.
     """
     logger.info("  Running WBT Watershed tool...")
     success = run_wbt("Watershed", {
         "d8_pntr"  : str(fdr_path),
-        "pour_pts" : str(pour_raster_path),
+        "pour_pts" : str(pour_shp_path),
         "output"   : str(watersheds_tif),
     }, logger)
     if not success:
@@ -862,15 +863,18 @@ def main():
         )
         _fixed_points.append((_best_r, _best_c, _nx, _ny, _best_fdr))
 
-    # Re-burn the (possibly relocated) pour points to the snapped raster
+    # Save the (possibly relocated) pour points as a shapefile.
+    # Passing a vector directly to WBT Watershed is more reliable than a
+    # raster — it sidesteps all int16/int32/float64 dtype hangs entirely.
     from shapely.geometry import Point as _ShapelyPoint
     _fixed_gdf = gpd.GeoDataFrame(
         {"POUR_ID": range(1, len(_fixed_points) + 1)},
         geometry=[_ShapelyPoint(_x, _y) for _, _, _x, _y, _ in _fixed_points],
         crs=primary.crs,
     )
-    _points_to_raster(_fixed_gdf, "POUR_ID", fac_path, snapped_tif)
-    logger.info(f"  Pour point raster finalised with {len(_fixed_gdf)} valid cell(s)")
+    pour_shp = output_dir / "pourpoints_final.shp"
+    _fixed_gdf[["POUR_ID", "geometry"]].to_file(str(pour_shp))
+    logger.info(f"  Pour point shapefile written: {pour_shp.name} ({len(_fixed_gdf)} point(s))")
 
     # ------------------------------------------------------------------
     # Step 3 & 4: WBT watershed delineation -> vectorise -> area stats
@@ -881,7 +885,7 @@ def main():
     watersheds_shp = output_dir / "watersheds.shp"
 
     gdf = delineate_and_vectorise(
-        fdr_path, snapped_tif, watersheds_tif, watersheds_shp, logger
+        fdr_path, pour_shp, watersheds_tif, watersheds_shp, logger
     )
 
     watershed_count = len(gdf)
@@ -903,6 +907,8 @@ def main():
     logger.info("Cleaning up intermediate files...")
     for tmp in [snapped_tif, watersheds_tif]:
         tmp.unlink(missing_ok=True)
+    for ext in [".shp", ".shx", ".dbf", ".prj", ".cpg"]:
+        (output_dir / f"pourpoints_final{ext}").unlink(missing_ok=True)
 
     elapsed = time.time() - start_time
     logger.info("=" * 60)
