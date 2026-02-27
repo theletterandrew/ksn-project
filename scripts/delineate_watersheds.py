@@ -26,14 +26,15 @@ Requirements:
 import logging
 import sys
 import time
+import warnings
 from pathlib import Path
-
 import subprocess
 
 import numpy as np
 import rasterio
 import rasterio.features
 import geopandas as gpd
+from shapely.geometry import shape as shapely_shape
 
 # Calculate the path to the project root (one level up from scripts/)
 root_dir = Path(__file__).resolve().parent.parent
@@ -72,15 +73,34 @@ MIN_DRAINAGE_AREA_CELLS = config.MIN_WATERSHED_AREA  # ~40 km² at 2m resolution
 # this distance to ensure they land exactly on the stream.
 SNAP_DISTANCE = config.SNAP_DISTANCE  # cells (e.g. 50 cells = 100 m at 2 m resolution)
 
+# Set to True to print per-cell FDR diagnostics around the snapped pour point.
+# Useful when WBT Watershed returns an empty result; disable for production runs.
+DEBUG_POUR_POINTS = False
+
 # =============================================================================
 # END CONFIG — No edits needed below this line
 # =============================================================================
 
 
+def setup_logging(output_dir: Path) -> logging.Logger:
+    log_path = output_dir / "delineate_watersheds.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.FileHandler(log_path),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+    return logging.getLogger(__name__)
+
+
 def run_wbt(tool: str, args: dict, logger: logging.Logger) -> bool:
     """
-    Run a WhiteboxTools command via subprocess, mirroring wbt_hydrology.py.
-    Returns True on success, exits the process on failure.
+    Run a WhiteboxTools command via subprocess.
+    Returns True on success, False on failure (does not exit).
+    Callers are responsible for deciding whether to abort.
     """
     cmd = [str(WBT_EXE), f"--run={tool}"]
     for key, val in args.items():
@@ -102,19 +122,6 @@ def run_wbt(tool: str, args: dict, logger: logging.Logger) -> bool:
         logger.error(f"  Failed to run {tool}: {e}")
         return False
 
-def setup_logging(output_dir: Path) -> logging.Logger:
-    log_path = output_dir / "delineate_watersheds.log"
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s  %(levelname)-8s  %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[
-            logging.FileHandler(log_path),
-            logging.StreamHandler(sys.stdout),
-        ],
-    )
-    return logging.getLogger(__name__)
-
 
 def extract_stream_endpoints(streams_gpkg: Path) -> gpd.GeoDataFrame:
     """
@@ -125,12 +132,8 @@ def extract_stream_endpoints(streams_gpkg: Path) -> gpd.GeoDataFrame:
     the centroid of each polygon, then keeping only the one with the highest
     flow accumulation value (sampled in the next step).
     """
-    streams = gpd.read_file(streams_gpkg, layer="streams")
-
-    # Derive a representative point from each geometry.
-    # centroid works for both Polygon and LineString inputs.
+    streams   = gpd.read_file(streams_gpkg, layer="streams")
     end_geoms = streams.geometry.centroid
-
     return gpd.GeoDataFrame(geometry=end_geoms, crs=streams.crs).reset_index(drop=True)
 
 
@@ -160,15 +163,15 @@ def points_to_raster(
     with rasterio.open(ref_raster_path) as src:
         meta      = src.meta.copy()
         transform = src.transform
-        shape     = (src.height, src.width)
+        arr_shape = (src.height, src.width)
 
     meta.update(dtype=rasterio.int32, count=1, nodata=-9999)
-    out_arr = np.full(shape, -9999, dtype=np.int32)
+    out_arr = np.full(arr_shape, -9999, dtype=np.int32)
 
     for _, row in points_gdf.iterrows():
         col_idx, row_idx = ~transform * (row.geometry.x, row.geometry.y)
         col_idx, row_idx = int(col_idx), int(row_idx)
-        if 0 <= row_idx < shape[0] and 0 <= col_idx < shape[1]:
+        if 0 <= row_idx < arr_shape[0] and 0 <= col_idx < arr_shape[1]:
             out_arr[row_idx, col_idx] = int(row[value_col])
 
     with rasterio.open(out_path, "w", **meta) as dst:
@@ -193,14 +196,16 @@ def snap_pour_points(
         nodata   = int(src.nodata) if src.nodata is not None else -9999
         meta     = src.meta.copy()
 
+    # Use float32 for FAC — halves memory vs float64 with no precision impact
+    # for the argmax comparison we do here.
     with rasterio.open(fac_path) as src:
-        fac_arr = src.read(1).astype(np.float64)
+        fac_arr = src.read(1).astype(np.float32)
         fac_nd  = src.nodata
 
     if fac_nd is not None:
         fac_arr[fac_arr == fac_nd] = -1.0
 
-    snapped = np.full_like(pour_arr, nodata)
+    snapped   = np.full_like(pour_arr, nodata)
     pour_rows, pour_cols = np.where(pour_arr != nodata)
 
     if len(pour_rows) == 0:
@@ -225,6 +230,35 @@ def snap_pour_points(
 
     with rasterio.open(out_path, "w", **meta) as dst:
         dst.write(snapped, 1)
+
+
+def debug_pour_points(snapped_tif: Path, fdr_path: Path, logger: logging.Logger) -> None:
+    """
+    Print FDR diagnostics for every snapped pour point cell.
+    Only called when DEBUG_POUR_POINTS = True.
+    """
+    with rasterio.open(snapped_tif) as src:
+        snapped_arr = src.read(1)
+        nodata      = src.nodata
+        transform   = src.transform
+        rows, cols  = np.where(snapped_arr != nodata)
+
+    with rasterio.open(fdr_path) as src:
+        fdr_arr    = src.read(1)
+        fdr_nodata = src.nodata
+
+    for r, c in zip(rows, cols):
+        x, y    = transform * (c, r)
+        fdr_val = fdr_arr[r, c]
+        logger.info(f"  Pour point ID={snapped_arr[r, c]} at row={r}, col={c}, coords=({x:.1f}, {y:.1f})")
+        if fdr_val == 0:
+            logger.warning(f"    FDR={fdr_val} — pour point is on a zero/flat cell!")
+        elif fdr_nodata is not None and fdr_val == fdr_nodata:
+            logger.warning(f"    FDR={fdr_val} — pour point is on a nodata cell!")
+        else:
+            logger.info(f"    FDR={fdr_val} — valid")
+        window = fdr_arr[max(0, r - 3):r + 4, max(0, c - 3):c + 4]
+        logger.info(f"    FDR values in 7x7 neighbourhood:\n{window}")
 
 
 def delineate_and_vectorise(
@@ -259,23 +293,16 @@ def delineate_and_vectorise(
         crs       = src.crs
         transform = src.transform
 
-    valid_mask = (arr != nodata).astype(np.uint8) if nodata is not None else np.ones(
-        arr.shape, dtype=np.uint8
+    valid_mask = (
+        (arr != nodata).astype(np.uint8)
+        if nodata is not None
+        else np.ones(arr.shape, dtype=np.uint8)
     )
 
-    shapes = list(
-        rasterio.features.shapes(arr.astype(np.int32), mask=valid_mask, transform=transform)
+    # Use a generator to avoid loading all shapes into memory at once
+    shapes_gen = rasterio.features.shapes(
+        arr.astype(np.int32), mask=valid_mask, transform=transform
     )
-
-    if not shapes:
-        logger.error(
-            "Vectorisation produced no polygons — the watershed raster appears empty. "
-            "Check that the pour point raster overlaps the flow direction raster."
-        )
-        sys.exit(1)
-
-    from shapely.geometry import shape as shapely_shape
-    import warnings
 
     # Silence the rasterio/GDAL 3.11 'Memory' driver deprecation warning —
     # it is harmless and will be fixed in a future rasterio release.
@@ -285,25 +312,27 @@ def delineate_and_vectorise(
         category=RuntimeWarning,
     )
 
-    geoms     = [shapely_shape(geom) for geom, _   in shapes]
-    gridcodes = [int(val)            for _,    val in shapes]
+    geoms, gridcodes = [], []
+    for geom_dict, val in shapes_gen:
+        geoms.append(shapely_shape(geom_dict))
+        gridcodes.append(int(val))
 
-    # Explicitly name the geometry column to prevent dissolve from dropping it
-    gdf = gpd.GeoDataFrame(
-        {"gridcode": gridcodes},
-        geometry=geoms,
-        crs=crs,
-    )
+    if not geoms:
+        logger.error(
+            "Vectorisation produced no polygons — the watershed raster appears empty. "
+            "Check that the pour point raster overlaps the flow direction raster."
+        )
+        sys.exit(1)
+
+    gdf = gpd.GeoDataFrame({"gridcode": gridcodes}, geometry=geoms, crs=crs)
 
     # Dissolve so each watershed ID becomes a single polygon
     gdf = gdf.dissolve(by="gridcode").reset_index()
 
-    # Area calculation: geometry.area returns values in the CRS linear units
-    # (metres for a projected CRS). Divide by 1e6 to get km².
-    # Log the raw area of the first polygon as a sanity check.
+    # Sanity-check the first polygon's area
     raw_area = gdf.geometry.area.iloc[0]
     logger.info(
-        f"  First polygon raw area: {raw_area:,.0f} CRS units\u00b2 "
+        f"  First polygon raw area: {raw_area:,.0f} CRS units² "
         f"(CRS: {crs.to_string() if crs else 'unknown'})"
     )
 
@@ -317,7 +346,6 @@ def delineate_and_vectorise(
         sys.exit(1)
 
     gdf["area_km2"] = gdf.geometry.area / 1e6
-
     gdf.to_file(watersheds_shp)
     return gdf
 
@@ -354,9 +382,8 @@ def main():
 
     # Read actual cell size from the FAC raster rather than hardcoding 2m
     with rasterio.open(fac_path) as src:
-        cell_w, cell_h  = abs(src.res[0]), abs(src.res[1])
-        cell_area_m2    = cell_w * cell_h
-        cell_area_km2   = cell_area_m2 / 1e6
+        cell_w, cell_h = abs(src.res[0]), abs(src.res[1])
+        cell_area_km2  = (cell_w * cell_h) / 1e6
 
     min_area_km2 = MIN_DRAINAGE_AREA_CELLS * cell_area_km2
 
@@ -392,9 +419,9 @@ def main():
         sys.exit(1)
 
     # Keep only the single outlet with the highest flow accumulation
-    primary = endpoints.sort_values("fac_value", ascending=False).iloc[[0]].copy()
-    primary["POUR_ID"]   = 1
-    primary_accum        = int(primary["fac_value"].iloc[0])
+    primary        = endpoints.sort_values("fac_value", ascending=False).iloc[[0]].copy()
+    primary["POUR_ID"] = 1
+    primary_accum  = int(primary["fac_value"].iloc[0])
     logger.info(f"  Primary outlet identified (Accumulation: {primary_accum:,} cells)")
 
     # ------------------------------------------------------------------
@@ -410,35 +437,12 @@ def main():
 
     temp_pour_raster.unlink(missing_ok=True)
 
-    # -----------------------------------------------------------------
-    # DEBUGGING
-    # -----------------------------------------------------------------
-    
-    # Check what the FDR value is at the snapped pour point location
-    with rasterio.open(snapped_tif) as src:
-        snapped_arr = src.read(1)
-        nodata = src.nodata
-        rows, cols = np.where(snapped_arr != nodata)
-        transform = src.transform
-        for r, c in zip(rows, cols):
-            x, y = transform * (c, r)
-            print(f"Pour point ID={snapped_arr[r,c]} at row={r}, col={c}, coords=({x:.1f}, {y:.1f})")
-
-    with rasterio.open(fdr_path) as src:
-        fdr_arr = src.read(1)
-        fdr_nodata = src.nodata
-        for r, c in zip(rows, cols):
-            fdr_val = fdr_arr[r, c]
-            print(f"  FDR value at pour point: {fdr_val}")
-            if fdr_val == 0:
-                print(f"  ERROR: pour point is on a zero/flat cell!")
-            elif fdr_nodata is not None and fdr_val == fdr_nodata:
-                print(f"  ERROR: pour point is on a nodata cell!")
-            else:
-                print(f"  OK: valid FDR value")
-            # Also check surrounding cells
-            window = fdr_arr[max(0,r-3):r+4, max(0,c-3):c+4]
-        print(f"  FDR values in 7x7 neighbourhood:\n{window}")
+    # ------------------------------------------------------------------
+    # Optional FDR diagnostics — set DEBUG_POUR_POINTS = True in CONFIG
+    # ------------------------------------------------------------------
+    if DEBUG_POUR_POINTS:
+        logger.info("DEBUG: Inspecting FDR values at snapped pour point(s)...")
+        debug_pour_points(snapped_tif, fdr_path, logger)
 
     # ------------------------------------------------------------------
     # Step 3 & 4: WBT watershed delineation → vectorise → area stats
@@ -460,8 +464,10 @@ def main():
     # ------------------------------------------------------------------
     logger.info("Step 5: Watershed area statistics:")
     for _, row in gdf.iterrows():
-        area_m2 = row.geometry.area
-        logger.info(f"  Watershed {int(row['gridcode'])}: {area_m2:,.0f} m²")
+        logger.info(
+            f"  Watershed {int(row['gridcode'])}: "
+            f"{row.geometry.area:,.0f} m²  ({row['area_km2']:.2f} km²)"
+        )
 
     # ------------------------------------------------------------------
     # Clean up intermediate rasters
