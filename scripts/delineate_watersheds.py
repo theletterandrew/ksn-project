@@ -459,25 +459,36 @@ def _points_to_raster(
     reference raster. Using the WBT FAC as the reference guarantees cell
     alignment with every other WBT-produced raster in the pipeline.
 
-    Written as float64 — WBT Watershed hangs silently on int32 pour point
-    rasters in some v2.4.0 builds.
+    Written as int16 — WBT Watershed requires an integer pour point raster.
+    float64 causes a silent hang on most WBT builds; int32 causes it on some.
+    int16 works reliably across all known versions and is what the WBT docs
+    specify for pour point inputs.
     """
     with rasterio.open(ref_raster_path) as src:
         meta      = src.meta.copy()
         transform = src.transform
         arr_shape = (src.height, src.width)
 
-    meta.update(dtype=rasterio.float64, count=1, nodata=-9999.0)
-    out_arr = np.full(arr_shape, -9999.0, dtype=np.float64)
+    NODATA_VAL = -9999
+    meta.update(dtype=rasterio.int16, count=1, nodata=NODATA_VAL)
+    out_arr = np.full(arr_shape, NODATA_VAL, dtype=np.int16)
 
+    burned = 0
     for _, row in points_gdf.iterrows():
         col_idx, row_idx = ~transform * (row.geometry.x, row.geometry.y)
         col_idx, row_idx = int(col_idx), int(row_idx)
         if 0 <= row_idx < arr_shape[0] and 0 <= col_idx < arr_shape[1]:
-            out_arr[row_idx, col_idx] = float(row[value_col])
+            out_arr[row_idx, col_idx] = int(row[value_col])
+            burned += 1
 
     with rasterio.open(out_path, "w", **meta) as dst:
         dst.write(out_arr, 1)
+
+    if burned == 0:
+        raise RuntimeError(
+            f"_points_to_raster: no points fell within the raster extent. "
+            f"Check that pour point coordinates match the reference raster CRS."
+        )
 
 
 def debug_pour_points(snapped_tif: Path, fdr_path: Path, logger: logging.Logger) -> None:
