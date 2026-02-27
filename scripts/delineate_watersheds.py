@@ -249,6 +249,17 @@ def snap_pour_points_wbt(
     """
     snap_dist_m = snap_distance_cells * cell_size
 
+    # Ensure pour points share the FAC raster CRS before writing to disk —
+    # WBT will silently sample wrong cells if the CRS differs.
+    with rasterio.open(fac_path) as src:
+        fac_crs = src.crs
+    if points_gdf.crs and fac_crs and points_gdf.crs != fac_crs:
+        logger.warning(
+            f"  Reprojecting pour points to FAC CRS before SnapPourPoints "
+            f"({points_gdf.crs.to_epsg()} -> {fac_crs.to_epsg()})"
+        )
+        points_gdf = points_gdf.to_crs(fac_crs)
+
     # Write the pour points to a temporary shapefile for WBT
     points_gdf[["POUR_ID", "geometry"]].to_file(str(temp_shp))
     logger.info(f"  Written {len(points_gdf)} pour point(s) to {temp_shp.name}")
@@ -483,15 +494,57 @@ def main():
     # ------------------------------------------------------------------
     logger.info("Step 1: Identifying all qualifying stream outlets...")
 
-    # extract_stream_endpoints now samples FAC internally and picks the
-    # higher-accumulation end of each line, so no separate sampling step needed.
+    # ------------------------------------------------------------------
+    # CRS alignment check: reproject stream endpoints to FAC raster CRS
+    # if they differ. A mismatch is the most common cause of all endpoints
+    # sampling near-zero FAC values even though the datasets cover the same
+    # area on the ground.
+    # ------------------------------------------------------------------
+    with rasterio.open(fac_path) as src:
+        fac_crs    = src.crs
+        fac_bounds = src.bounds
+        fac_nodata = src.nodata
+
     endpoints = extract_stream_endpoints(streams_shp, fac_path)
 
-    # Drop any points whose chosen end still landed outside the raster
+    stream_crs = endpoints.crs
+    if stream_crs and fac_crs and stream_crs != fac_crs:
+        logger.warning(
+            f"  CRS mismatch detected — reprojecting stream endpoints "
+            f"from {stream_crs.to_epsg() or stream_crs.to_string()} "
+            f"to FAC CRS {fac_crs.to_epsg() or fac_crs.to_string()}"
+        )
+        endpoints = endpoints.to_crs(fac_crs)
+    else:
+        logger.info(
+            f"  CRS match confirmed: "
+            f"{fac_crs.to_epsg() or fac_crs.to_string()}"
+        )
+
+    # Sanity-check: do any endpoints fall inside the FAC raster bounding box?
+    xs = [g.x for g in endpoints.geometry]
+    ys = [g.y for g in endpoints.geometry]
+    inside = sum(
+        fac_bounds.left <= x <= fac_bounds.right and
+        fac_bounds.bottom <= y <= fac_bounds.top
+        for x, y in zip(xs, ys)
+    )
+    logger.info(
+        f"  {inside}/{len(endpoints)} endpoint(s) fall within FAC raster extent "
+        f"({fac_bounds.left:.1f}, {fac_bounds.bottom:.1f}, "
+        f"{fac_bounds.right:.1f}, {fac_bounds.top:.1f})"
+    )
+    if inside == 0:
+        logger.error(
+            "No stream endpoints fall within the FAC raster extent after CRS "
+            "alignment. Check that both datasets cover the same geographic area."
+        )
+        sys.exit(1)
+
+    # Sample FAC at each (now CRS-aligned) endpoint
     with rasterio.open(fac_path) as src:
-        fac_nodata = src.nodata
-        coords     = [(g.x, g.y) for g in endpoints.geometry]
-        fac_vals   = [v[0] for v in src.sample(coords)]
+        coords   = [(g.x, g.y) for g in endpoints.geometry]
+        fac_vals = [v[0] for v in src.sample(coords)]
 
     endpoints["fac_value"] = fac_vals
     if fac_nodata is not None:
