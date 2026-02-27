@@ -56,7 +56,7 @@ EPT_URL = "http://usgs-lidar-public.s3.amazonaws.com/USGS_LPC_CA_SoCal_Wildfires
 if TEST_RUN:
     # Santa Ana Mountains — Harding Canyon / Modjeska Peak / Santiago Canyon
     # Coordinates in EPSG:3857 (Web Mercator), ~16x16 km mountain block
-    BOUNDS_STR = "([-13093399, -13076701],[3980565, 3996621])"
+    BOUNDS_STR = "([-13019604.10007319,-13011847.908645347],[4042114.9998774235,4048656.1237727343])"
     print("--- RUNNING IN TEST MODE (Small Area) ---")
 else:
     # The full study area bounds
