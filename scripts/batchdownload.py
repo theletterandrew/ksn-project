@@ -287,7 +287,7 @@ if __name__ == "__main__":
 
     total = len(tiles)
     mode = "TEST" if config.TEST_RUN else "PRODUCTION"
-    print(f"--- {mode} Sync: {total} tiles @ {config.RES}m resolution ---")
+    print(f"--- {mode} Sync: {total} tiles @ native resolution ---")
 
     start_time = time.time()
     for i, tile in enumerate(tiles):
