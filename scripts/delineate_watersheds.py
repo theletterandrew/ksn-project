@@ -438,6 +438,15 @@ def main():
     points_to_raster(primary, "POUR_ID", fac_path, temp_pour_raster)
     snap_pour_points(temp_pour_raster, fac_path, SNAP_DISTANCE, snapped_tif, logger)
 
+    # Temporary debug section
+    import rasterio
+    with rasterio.open(snapped_tif) as src:
+        print(f"snapped dtype : {src.dtypes[0]}")
+        print(f"snapped nodata: {src.nodata}")
+        arr = src.read(1)
+        valid = arr[arr != src.nodata]
+        print(f"valid cells   : {len(valid)}")
+        print(f"unique values : {valid}")
     temp_pour_raster.unlink(missing_ok=True)
 
     # ------------------------------------------------------------------
