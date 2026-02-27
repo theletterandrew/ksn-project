@@ -32,6 +32,7 @@ import rasterio
 import rasterio.features
 import fiona
 import fiona.crs
+from shapely.geometry import shape
 
 # Calculate the path to the project root (one level up from scripts/)
 root_dir = Path(__file__).resolve().parent.parent
@@ -62,6 +63,15 @@ OUTPUT_FILE = "streams_connected.gpkg"  # Output stream network (GeoPackage)
 #   2,500,000 cells = ~10 km²  (major channels only)
 THRESHOLD = config.STREAM_THRESHOLD  # cells (~4 km² at 2m resolution)
 
+# Minimum number of pixels a stream polygon must contain to be written.
+# Filters out single-pixel noise and tiny isolated patches.
+# At 2m resolution, 5 pixels = 20 m² — adjust as needed.
+MIN_PIXELS = 5
+
+# Number of features to buffer before each fiona batch write.
+# Larger values reduce I/O overhead on big networks.
+BATCH_SIZE = 1000
+
 # =============================================================================
 # END CONFIG — No edits needed below this line
 # =============================================================================
@@ -81,61 +91,92 @@ def setup_logging(output_dir: Path) -> logging.Logger:
     return logging.getLogger(__name__)
 
 
-def vectorize_streams(stream_mask: np.ndarray, transform, crs, out_path: Path,
-                      logger: logging.Logger) -> int:
+def vectorize_streams(
+    stream_mask: np.ndarray,
+    transform,
+    crs,
+    out_path: Path,
+    logger: logging.Logger,
+    min_pixels: int = MIN_PIXELS,
+    batch_size: int = BATCH_SIZE,
+) -> int:
     """
-    Vectorize a binary stream mask into polygon features using
-    rasterio.features.shapes, then write to a GeoPackage.
+    Vectorize a binary stream mask into polygon features and write to a
+    GeoPackage.
 
-    rasterio.features.shapes runs in C and handles large rasters efficiently —
-    far faster than pixel-by-pixel Python tracing. It produces polygon rings
-    around connected pixel groups, giving the stream corridor footprint at
-    raster resolution.
+    Key efficiency improvements over the original:
+    - Uses a generator (not a list) for rasterio.features.shapes so shapes
+      are processed one at a time without loading all into memory at once.
+    - Filters tiny polygons by area before writing to cut output bloat.
+    - Batches fiona writes (writerecords) instead of writing one feature at
+      a time, significantly reducing I/O overhead on large networks.
+    - Stores area_m2 as an attribute for convenient downstream filtering.
 
     Returns the number of features written.
     """
-    # rasterio.features.shapes requires uint8 input
     mask_uint8 = stream_mask.astype(np.uint8)
 
-    # Extract shapes only where mask == 1, using 8-connectivity
-    shapes = list(rasterio.features.shapes(
-        mask_uint8,
-        mask=mask_uint8,
-        transform=transform,
-        connectivity=8
-    ))
-
-    if not shapes:
-        return 0
+    # Area of one raster pixel in map units² (handles non-square pixels)
+    pixel_area = abs(transform.a * transform.e)
+    min_area   = min_pixels * pixel_area
 
     schema = {
         "geometry": "Polygon",
-        "properties": {"seg_id": "int"}
+        "properties": {
+            "seg_id":  "int",
+            "area_m2": "float",
+        }
     }
 
     out_crs = crs.to_wkt() if crs else None
 
-    # Remove existing file so fiona writes fresh
+    # Remove existing output so fiona writes a fresh file
     if out_path.exists():
         out_path.unlink()
 
     count = 0
+    batch = []
+
+    # rasterio.features.shapes returns a generator — memory-efficient for
+    # large rasters since shapes are yielded one at a time.
+    shapes_gen = rasterio.features.shapes(
+        mask_uint8,
+        mask=mask_uint8,
+        transform=transform,
+        connectivity=8,
+    )
+
     with fiona.open(
         str(out_path),
         mode="w",
         driver="GPKG",
         schema=schema,
         crs=out_crs,
-        layer="streams"
+        layer="streams",
     ) as dst:
-        for geom_dict, value in shapes:
+        for geom_dict, value in shapes_gen:
             if value != 1:
                 continue
+
+            # Filter out tiny noise polygons before computing anything else
+            geom = shape(geom_dict)
+            if geom.area < min_area:
+                continue
+
             count += 1
-            dst.write({
-                "geometry": geom_dict,
-                "properties": {"seg_id": count}
+            batch.append({
+                "geometry":   geom_dict,
+                "properties": {"seg_id": count, "area_m2": round(geom.area, 2)},
             })
+
+            # Flush batch to disk periodically to keep memory usage flat
+            if len(batch) >= batch_size:
+                dst.writerecords(batch)
+                batch.clear()
+
+        # Write any remaining features
+        if batch:
+            dst.writerecords(batch)
 
     return count
 
@@ -157,6 +198,7 @@ def main():
         sys.exit(1)
 
     logger.info(f"Threshold : {THRESHOLD:,} cells (~{THRESHOLD * 4 / 1e6:.1f} km² at 2m)")
+    logger.info(f"Min pixels: {MIN_PIXELS} (~{MIN_PIXELS * 4:.0f} m² at 2m)")
     logger.info("-" * 60)
 
     start_time = time.time()
@@ -165,7 +207,10 @@ def main():
         # --- Step 1: Read flow accumulation and apply threshold ---
         logger.info("Reading flow accumulation raster...")
         with rasterio.open(str(fac_path)) as fac_ds:
-            fac_data  = fac_ds.read(1).astype(np.float64)
+            # Use float32 instead of float64 — halves peak memory usage.
+            # FAC values rarely need double precision; float32 handles up to
+            # ~16.7 million exactly, and larger values with minor rounding.
+            fac_data  = fac_ds.read(1).astype(np.float32)
             transform = fac_ds.transform
             crs       = fac_ds.crs
             nodata    = fac_ds.nodata
@@ -181,12 +226,14 @@ def main():
         logger.info(f"  Stream pixels above threshold: {pixel_count:,}")
 
         if pixel_count == 0:
-            logger.error("No stream pixels found at this threshold. "
-                         "Lower THRESHOLD or check input data.")
+            logger.error(
+                "No stream pixels found at this threshold. "
+                "Lower THRESHOLD or check input data."
+            )
             sys.exit(1)
 
-        # Free the full FAC array now that we have the mask
-        del fac_data
+        # Free the full FAC array — no longer needed
+        del fac_data, valid_mask
 
         # --- Step 2: Vectorize stream mask ---
         logger.info("Vectorizing stream mask...")
@@ -196,7 +243,10 @@ def main():
         logger.info(f"  Features written: {count:,}")
 
         if count == 0:
-            logger.error("No features were written. Check input data and threshold.")
+            logger.error(
+                "No features were written. "
+                "Check input data, threshold, and MIN_PIXELS setting."
+            )
             sys.exit(1)
 
         elapsed = time.time() - start_time
