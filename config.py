@@ -64,7 +64,7 @@ else:
 
 # --- DOWNLOAD PARAMETERS ---
 # Enter your download tile size in meters
-TILE_SIZE = 5000
+TILE_SIZE = 6000 if TEST_RUN else 5000
 
 # Enter the amount of overlap between tiles in meters
 OVERLAP = 200
