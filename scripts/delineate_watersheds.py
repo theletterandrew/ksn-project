@@ -237,6 +237,137 @@ def extract_stream_outlets(streams_gpkg: Path, fac_path: Path, sample_spacing_m:
 
     return gpd.GeoDataFrame(geometry=chosen, crs=streams.crs).reset_index(drop=True)
 
+
+def find_outlets_from_fac(
+    fac_path: Path,
+    fdr_path: Path,
+    min_accum_cells: int,
+    min_sep_m: float,
+    logger: logging.Logger,
+) -> gpd.GeoDataFrame:
+    """
+    Derive pour points directly from the FAC and FDR rasters, bypassing the
+    stream vector layer entirely.
+
+    A cell is treated as an outlet if it meets ALL of these criteria:
+      1. FAC >= min_accum_cells  (large enough drainage area)
+      2. It is a local FAC maximum within min_sep_m radius  (avoids duplicates
+         on the same trunk — keeps only the furthest-downstream cell per stream)
+      3. Its D8 flow direction points OUT of the raster, OR it drains into a
+         nodata cell  (i.e. it is a true outlet at the study-area boundary)
+
+    If criterion 3 yields no outlets (closed basin / internal drainage), the
+    function falls back to the single cell with the highest FAC value so the
+    pipeline always produces at least one watershed.
+    """
+    from rasterio.transform import xy as rio_xy
+
+    with rasterio.open(fac_path) as src:
+        fac_arr   = src.read(1).astype(np.float64)
+        fac_nd    = src.nodata
+        transform = src.transform
+        crs       = src.crs
+        nrows, ncols = src.shape
+
+    with rasterio.open(fdr_path) as src:
+        fdr_arr = src.read(1)
+        fdr_nd  = src.nodata
+
+    if fac_nd is not None:
+        fac_arr[fac_arr == fac_nd] = 0
+
+    # WBT D8 pointer values and their (row, col) offsets
+    D8_OFFSETS = {
+        1:   ( 0,  1),   # E
+        2:   ( 1,  1),   # SE
+        4:   ( 1,  0),   # S
+        8:   ( 1, -1),   # SW
+        16:  ( 0, -1),   # W
+        32:  (-1, -1),   # NW
+        64:  (-1,  0),   # N
+        128: (-1,  1),   # NE
+    }
+
+    # ------------------------------------------------------------------
+    # Criterion 1: cells above the accumulation threshold
+    # ------------------------------------------------------------------
+    rows_above, cols_above = np.where(fac_arr >= min_accum_cells)
+    if len(rows_above) == 0:
+        logger.error(
+            f"No FAC cells >= {min_accum_cells:,}. "
+            "Check MIN_WATERSHED_AREA in config.py."
+        )
+        return gpd.GeoDataFrame(geometry=[], crs=crs)
+
+    logger.info(f"  {len(rows_above):,} FAC cells >= {min_accum_cells:,} cells")
+
+    # ------------------------------------------------------------------
+    # Criterion 2: local FAC maxima within min_sep_m radius (fast numpy)
+    # Keep a cell only if no neighbour within the radius has a higher FAC.
+    # We approximate the radius as a square window for speed.
+    # ------------------------------------------------------------------
+    with rasterio.open(fac_path) as src:
+        cell_size = abs(src.res[0])
+    half_win = max(1, int(min_sep_m / cell_size))
+
+    local_max_mask = np.zeros(fac_arr.shape, dtype=bool)
+    for r, c in zip(rows_above, cols_above):
+        r0, r1 = max(0, r - half_win), min(nrows, r + half_win + 1)
+        c0, c1 = max(0, c - half_win), min(ncols, c + half_win + 1)
+        if fac_arr[r, c] == fac_arr[r0:r1, c0:c1].max():
+            local_max_mask[r, c] = True
+
+    rows_lm, cols_lm = np.where(local_max_mask)
+    logger.info(f"  {len(rows_lm):,} local FAC maxima after deduplication")
+
+    # ------------------------------------------------------------------
+    # Criterion 3: cell drains to raster edge or nodata (true outlet)
+    # ------------------------------------------------------------------
+    outlet_rows, outlet_cols = [], []
+    for r, c in zip(rows_lm, cols_lm):
+        fdr_val = int(fdr_arr[r, c])
+        if fdr_nd is not None and fdr_val == fdr_nd:
+            continue
+        offset = D8_OFFSETS.get(fdr_val)
+        if offset is None:
+            continue
+        nr, nc = r + offset[0], c + offset[1]
+        # True outlet: next cell is outside raster bounds or is nodata in FAC
+        if not (0 <= nr < nrows and 0 <= nc < ncols):
+            outlet_rows.append(r)
+            outlet_cols.append(c)
+        elif fac_nd is not None and fdr_arr[nr, nc] == fdr_nd:
+            outlet_rows.append(r)
+            outlet_cols.append(c)
+
+    logger.info(f"  {len(outlet_rows)} boundary outlet(s) identified")
+
+    # Fallback: if no boundary outlets found (closed/internal basin), use the
+    # global FAC maximum so the pipeline always produces at least one watershed.
+    if not outlet_rows:
+        logger.warning(
+            "  No boundary outlets found — basin may be internally drained. "
+            "Falling back to the global FAC maximum as a single outlet."
+        )
+        r, c = np.unravel_index(np.argmax(fac_arr), fac_arr.shape)
+        outlet_rows, outlet_cols = [r], [c]
+
+    # Convert row/col indices to map coordinates
+    xs, ys = rio_xy(transform, outlet_rows, outlet_cols)
+    points = [gpd.points_from_xy([x], [y])[0] for x, y in zip(xs, ys)]
+
+    gdf = gpd.GeoDataFrame(
+        {"fac_value": [float(fac_arr[r, c]) for r, c in zip(outlet_rows, outlet_cols)]},
+        geometry=points,
+        crs=crs,
+    )
+    logger.info(
+        f"  Outlet FAC range: "
+        f"min={gdf['fac_value'].min():,.0f}  "
+        f"max={gdf['fac_value'].max():,.0f}"
+    )
+    return gdf
+
 def sample_raster_at_points(
     raster_path: Path, points_gdf: gpd.GeoDataFrame, col_name: str
 ) -> gpd.GeoDataFrame:
@@ -552,118 +683,29 @@ def main():
     # ------------------------------------------------------------------
     # Step 1: Extract stream endpoints and sample FAC values
     # ------------------------------------------------------------------
-    logger.info("Step 1: Identifying all qualifying stream outlets...")
+    logger.info("Step 1: Identifying all qualifying stream outlets from FAC raster...")
 
-    # ------------------------------------------------------------------
-    # CRS alignment check: reproject stream endpoints to FAC raster CRS
-    # if they differ. A mismatch is the most common cause of all endpoints
-    # sampling near-zero FAC values even though the datasets cover the same
-    # area on the ground.
-    # ------------------------------------------------------------------
-    with rasterio.open(fac_path) as src:
-        fac_crs    = src.crs
-        fac_bounds = src.bounds
-        fac_nodata = src.nodata
+    # Derive outlets directly from the FAC + FDR rasters rather than from the
+    # stream vector layer. The stream GeoPackage may only cover headwater
+    # segments and never intersect the high-accumulation trunk cells, so
+    # vector-based outlet detection is unreliable for full-DEM tiling.
+    min_sep_m = SNAP_DISTANCE * cell_w * 3  # minimum distance between outlets
 
-    endpoints = extract_stream_outlets(streams_shp, fac_path)
-
-    stream_crs = endpoints.crs
-    if stream_crs and fac_crs and stream_crs != fac_crs:
-        logger.warning(
-            f"  CRS mismatch detected — reprojecting stream endpoints "
-            f"from {stream_crs.to_epsg() or stream_crs.to_string()} "
-            f"to FAC CRS {fac_crs.to_epsg() or fac_crs.to_string()}"
-        )
-        endpoints = endpoints.to_crs(fac_crs)
-    else:
-        logger.info(
-            f"  CRS match confirmed: "
-            f"{fac_crs.to_epsg() or fac_crs.to_string()}"
-        )
-
-    # Sanity-check: do any endpoints fall inside the FAC raster bounding box?
-    xs = [g.x for g in endpoints.geometry]
-    ys = [g.y for g in endpoints.geometry]
-    inside = sum(
-        fac_bounds.left <= x <= fac_bounds.right and
-        fac_bounds.bottom <= y <= fac_bounds.top
-        for x, y in zip(xs, ys)
-    )
-    logger.info(
-        f"  {inside}/{len(endpoints)} endpoint(s) fall within FAC raster extent "
-        f"({fac_bounds.left:.1f}, {fac_bounds.bottom:.1f}, "
-        f"{fac_bounds.right:.1f}, {fac_bounds.top:.1f})"
-    )
-    if inside == 0:
-        logger.error(
-            "No stream endpoints fall within the FAC raster extent after CRS "
-            "alignment. Check that both datasets cover the same geographic area."
-        )
-        sys.exit(1)
-
-    # Sample FAC at each (now CRS-aligned) endpoint
-    with rasterio.open(fac_path) as src:
-        coords   = [(g.x, g.y) for g in endpoints.geometry]
-        fac_vals = [v[0] for v in src.sample(coords)]
-
-    endpoints["fac_value"] = fac_vals
-    if fac_nodata is not None:
-        endpoints = endpoints[endpoints["fac_value"] != fac_nodata]
-    endpoints = endpoints[endpoints["fac_value"] > 0]
-
-    if endpoints.empty:
-        logger.error(
-            "No stream endpoints overlapped the FAC raster. "
-            "Confirm that streams_connected.gpkg and flow_accumulation.tif "
-            "share the same CRS and cover the same area."
-        )
-        sys.exit(1)
-
-    # Diagnostic: show the FAC distribution so threshold problems are obvious
-    fac_series = endpoints["fac_value"]
-    logger.info(
-        f"  Endpoint FAC stats — n={len(fac_series)}  "
-        f"min={fac_series.min():,.0f}  "
-        f"median={fac_series.median():,.0f}  "
-        f"max={fac_series.max():,.0f}  "
-        f"(threshold={MIN_DRAINAGE_AREA_CELLS:,})"
-    )
-
-    # Keep every outlet whose FAC meets the minimum drainage-area threshold.
-    primary = (
-        endpoints[endpoints["fac_value"] >= MIN_DRAINAGE_AREA_CELLS]
-        .sort_values("fac_value", ascending=False)
-        .copy()
+    primary = find_outlets_from_fac(
+        fac_path, fdr_path, MIN_DRAINAGE_AREA_CELLS, min_sep_m, logger
     )
 
     if primary.empty:
         logger.error(
-            f"No stream endpoints exceeded the minimum drainage-area threshold "
-            f"({MIN_DRAINAGE_AREA_CELLS:,} cells). "
-            f"The highest FAC value seen was {fac_series.max():,.0f} cells. "
-            f"Either lower MIN_WATERSHED_AREA in config.py, or verify that the "
-            f"stream network and FAC raster share the same CRS and extent."
+            f"find_outlets_from_fac returned no outlets for threshold "
+            f"{MIN_DRAINAGE_AREA_CELLS:,} cells. Lower MIN_WATERSHED_AREA in config.py."
         )
         sys.exit(1)
 
-    # ------------------------------------------------------------------
-    # Spatial deduplication: nearby segments of the same trunk will
-    # produce nearly-identical pour points and overlapping watersheds.
-    # Keep only the highest-FAC point within a minimum separation distance
-    # (3x the snap radius) so each tributary gets at most one outlet.
-    # ------------------------------------------------------------------
-    min_sep_m = SNAP_DISTANCE * cell_w * 3  # e.g. 50 cells * 2 m * 3 = 300 m
-    kept = []
-    for _, row in primary.iterrows():
-        pt = row.geometry
-        if all(pt.distance(k.geometry) >= min_sep_m for k in kept):
-            kept.append(row)
-
-    primary = gpd.GeoDataFrame(kept, crs=endpoints.crs).reset_index(drop=True)
+    primary = primary.sort_values("fac_value", ascending=False).reset_index(drop=True)
     primary["POUR_ID"] = range(1, len(primary) + 1)
-
     logger.info(
-        f"  {len(primary)} qualifying outlet(s) identified "
+        f"  {len(primary)} outlet(s) selected "
         f"(FAC >= {MIN_DRAINAGE_AREA_CELLS:,} cells, "
         f"min separation {min_sep_m:.0f} m)"
     )
