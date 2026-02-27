@@ -64,10 +64,10 @@ else:
 
 # --- DOWNLOAD PARAMETERS ---
 # Enter your download tile size in meters
-TILE_SIZE = 5000
+TILE_SIZE = 1000 if TEST_RUN else 5000
 
 # Enter the amount of overlap between tiles in meters
-OVERLAP = 2000
+OVERLAP = 200
 
 # Enter the LiDAR resolution you'd like to download in meters
 RES = 2.0
