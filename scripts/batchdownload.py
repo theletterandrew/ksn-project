@@ -1,277 +1,57 @@
-"""
-batchdownload.py
-----------------
-Downloads ground-classified LiDAR tiles from a USGS EPT dataset by directly
-traversing the EPT quadtree hierarchy and fetching LAZ node files.
-
-Replaces PDAL with requests + laspy, preserving identical output:
-  - Spatial subsetting via bounding box
-  - Ground-only filtering (Classification=2)
-  - LAZ-compressed output
-
-EPT format reference: https://entwine.io/entwine-point-tile.html
-"""
-
-import io
-import sys
+import pdal
 import json
 import time
-import requests
-import laspy
-import numpy as np
+import sys
 from pathlib import Path
 from shapely.geometry import box
 
-# Project root (one level up from scripts/)
+# Project root setup
 root_dir = Path(__file__).resolve().parent.parent
 if str(root_dir) not in sys.path:
     sys.path.append(str(root_dir))
 
 import config
 
-
-# ---------------------------------------------------------------------------
-# EPT Helpers
-# ---------------------------------------------------------------------------
-
-def fetch_json(url: str) -> dict:
-    response = requests.get(url, timeout=30)
-    response.raise_for_status()
-    return response.json()
-
-
-def node_bounds(ept_bounds: list, d: int, x: int, y: int) -> tuple:
+def run_download_pdal(minx, maxx, miny, maxy, filename: str):
     """
-    Calculate the spatial bounds of an EPT node given its depth/x/y address.
-    EPT bounds are [minx, miny, minz, maxx, maxy, maxz].
-    We only care about x/y for 2D intersection testing.
-    Returns (minx, miny, maxx, maxy).
+    Executes a PDAL pipeline for a specific tile.
     """
-    minx, miny, _, maxx, maxy, _ = ept_bounds
-    step_x = (maxx - minx) / (2 ** d)
-    step_y = (maxy - miny) / (2 ** d)
-    return (
-        minx + x * step_x,
-        miny + y * step_y,
-        minx + (x + 1) * step_x,
-        miny + (y + 1) * step_y,
-    )
+    # PDAL bounds format: ([minx, maxx], [miny, maxy])
+    pdal_bounds = f"([{minx}, {maxx}], [{miny}, {maxy}])"
 
+    pipeline_definition = [
+        {
+            "type": "readers.ept",
+            "filename": config.EPT_URL,
+            "bounds": pdal_bounds,
+            "resolution": 0.01  # Native resolution
+        },
+        {
+            "type": "filters.range",
+            "limits": "Classification[2:2]" # Ground only
+        },
+        {
+            "type": "writers.las",
+            "filename": filename,
+            "compression": "lazperf"
+        }
+    ]
 
-def boxes_intersect(a: tuple, b: tuple) -> bool:
-    """Check if two (minx, miny, maxx, maxy) boxes intersect."""
-    return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
-
-
-def fetch_hierarchy_page(base_url: str, key: str) -> dict:
-    """
-    Fetch a sub-page of the EPT hierarchy.
-    EPT stores deep hierarchy nodes in separate JSON files when the tree
-    is too large to fit in a single 0-0-0-0.json. A node value of -1
-    signals that its children live in a separate page at ept-hierarchy/{key}.json.
-    """
-    url = f"{base_url}/ept-hierarchy/{key}.json"
-    try:
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-        return response.json()
-    except Exception:
-        return {}
-
-
-def collect_nodes(
-    hierarchy: dict,
-    ept_bounds: list,
-    query_box: tuple,
-    base_url: str,
-    d: int = 0,
-    x: int = 0,
-    y: int = 0,
-    z: int = 0,
-    nodes: list = None,
-    leaf_only: bool = False,
-) -> list:
-    """
-    Recursively traverse the EPT hierarchy to collect node keys whose bounds
-    intersect the query bounding box.
-
-    EPT hierarchy pagination: when a node's value is -1, its children are
-    stored in a separate hierarchy page at ept-hierarchy/{key}.json. This
-    function fetches those sub-pages on demand so the full tree is traversed
-    down to the highest-resolution leaf nodes.
-
-    leaf_only=True collects only leaf nodes (no children in hierarchy),
-    which avoids double-counting points that appear in both parent and child
-    nodes. Set to False to include all levels (original behaviour).
-    """
-    if nodes is None:
-        nodes = []
-
-    key = f"{d}-{x}-{y}-{z}"
-
-    # Prune branches that don't intersect our query box (x/y only)
-    nb = node_bounds(ept_bounds, d, x, y)
-    if not boxes_intersect(nb, query_box):
-        return nodes
-
-    # Check this node's status in the hierarchy
-    # d=0 root is implicit (not in hierarchy dict), treat as present
-    node_val = hierarchy.get(key, 0 if d == 0 else None)
-
-    if d > 0 and node_val is None:
-        # Node not in hierarchy at all — branch doesn't exist
-        return nodes
-
-    # node_val == -1 means children are in a separate hierarchy sub-page
-    if node_val == -1:
-        sub_page = fetch_hierarchy_page(base_url, key)
-        hierarchy.update(sub_page)
-        node_val = hierarchy.get(key, 0)
-
-    has_children = any(
-        hierarchy.get(f"{d+1}-{x*2+dx}-{y*2+dy}-{z*2+dz}") is not None
-        for dx in range(2) for dy in range(2) for dz in range(2)
-    )
-
-    # Collect this node
-    if d > 0:
-        if leaf_only:
-            if not has_children:
-                nodes.append(key)
-        else:
-            nodes.append(key)
-
-    # Recurse into children
-    for dx in range(2):
-        for dy in range(2):
-            for dz in range(2):
-                collect_nodes(
-                    hierarchy, ept_bounds, query_box, base_url,
-                    d + 1, x * 2 + dx, y * 2 + dy, z * 2 + dz,
-                    nodes, leaf_only,
-                )
-
-    return nodes
-
-
-def download_node(base_url: str, key: str) -> bytes:
-    """Download a single EPT LAZ node file and return its raw bytes."""
-    url = f"{base_url}/ept-data/{key}.laz"
-    response = requests.get(url, timeout=120)
-    response.raise_for_status()
-    return response.content
-
-
-# ---------------------------------------------------------------------------
-# Main Download Function
-# ---------------------------------------------------------------------------
-
-def run_download(tile_box, filename: str):
-    """
-    Downloads all EPT nodes intersecting tile_box, filters to ground points
-    (Classification=2) with spatial clipping, and writes a LAZ file.
-    Each node is processed individually to avoid laspy concatenation issues.
-    """
-    b = tile_box.bounds  # (minx, miny, maxx, maxy)
-    query_box = (b[0], b[1], b[2], b[3])
-    base_url = config.EPT_URL.rsplit("/", 1)[0]
-
-    # --- Step 1: Load EPT metadata and root hierarchy ---
-    ept_info = fetch_json(config.EPT_URL)
-    ept_bounds = ept_info["bounds"]
-    hierarchy = fetch_json(f"{base_url}/ept-hierarchy/0-0-0-0.json")
-
-    # --- Step 2: Find all nodes that intersect our tile ---
-    if hierarchy is None:
-        raise ValueError("Failed to fetch EPT hierarchy - got None response.")
-
-    # leaf_only=True fetches only the highest-resolution nodes, avoiding
-    # double-counting points that appear in both parent and child tiles.
-    nodes = collect_nodes(hierarchy, ept_bounds, query_box, base_url, leaf_only=True)
-
-    if not nodes:
-        raise ValueError(
-            f"No EPT nodes found intersecting bounds {query_box}. "
-            "Check that BOUNDS_STR in config.py is within the dataset extent."
-        )
-
-    # --- Step 3: Download each node, clip and filter, accumulate results ---
-    base_header = None
-    filtered_arrays = []
-
-    for key in nodes:
-        raw = download_node(base_url, key)
-        with laspy.open(io.BytesIO(raw)) as reader:
-            las = reader.read()
-
-        if base_header is None:
-            base_header = las.header
-
-        x_off = las.header.offsets[0]
-        y_off = las.header.offsets[1]
-        x_sc  = las.header.scales[0]
-        y_sc  = las.header.scales[1]
-
-        # Work with the raw numpy array directly — avoid laspy point record indexing
-        raw_array = las.points.array
-
-        x_coords = x_off + x_sc * raw_array["X"].astype(np.float64)
-        y_coords = y_off + y_sc * raw_array["Y"].astype(np.float64)
-
-        spatial_mask = (
-            (x_coords >= b[0]) & (x_coords <= b[2]) &
-            (y_coords >= b[1]) & (y_coords <= b[3])
-        )
-        ground_mask = raw_array["raw_classification"] == 2
-        final_mask  = spatial_mask & ground_mask
-
-        if final_mask.any():
-            filtered_arrays.append(raw_array[final_mask])
-
-    if not filtered_arrays:
-        raise ValueError(
-            "No ground points found in this tile after filtering. "
-            "The tile may be empty or outside the dataset extent."
-        )
-
-    # --- Step 4: Merge and write LAZ ---
-    merged_array = np.concatenate(filtered_arrays)
-    final_points = laspy.PackedPointRecord(merged_array, base_header.point_format)
-
-    out_las = laspy.LasData(header=base_header)
-    out_las.points = final_points
-
-    with laspy.open(
-        filename,
-        mode="w",
-        header=out_las.header,
-        laz_backend=laspy.LazBackend.LazrsParallel
-    ) as writer:
-        writer.write_points(out_las.points)
-
-
-# ---------------------------------------------------------------------------
-# Entry Point
-# ---------------------------------------------------------------------------
+    pipeline = pdal.Pipeline(json.dumps(pipeline_definition))
+    pipeline.execute()
 
 if __name__ == "__main__":
     config.DATA_RAW.mkdir(parents=True, exist_ok=True)
 
-    # Verify EPT endpoint is reachable before starting
-    print(f"Verifying EPT endpoint: {config.EPT_URL}")
-    try:
-        fetch_json(config.EPT_URL)
-        print("Endpoint OK.")
-    except Exception as e:
-        print(f"ERROR: Could not reach EPT endpoint. Check EPT_URL in config.py.\n  {e}")
-        sys.exit(1)
-
-    # Parse Study Area Bounds
+    # 1. Parse Study Area Bounds from config.py
+    # Re-using your logic to strip brackets/parentheses
     clean = config.BOUNDS_STR.replace("(", "").replace(")", "").replace("[", "").replace("]", "")
     p = [float(x) for x in clean.split(",")]
+    
+    # Coordinates are expected as: minx, maxx, miny, maxy
     study_area = box(p[0], p[2], p[1], p[3])
 
-    # Generate Overlapping Tiles
+    # 2. Generate Overlapping Tiles
     tiles = []
     step = config.TILE_SIZE - config.OVERLAP
 
@@ -279,36 +59,37 @@ if __name__ == "__main__":
     while x < p[1]:
         y = p[2]
         while y < p[3]:
-            tile = box(x, y, x + config.TILE_SIZE, y + config.TILE_SIZE)
-            clipped_tile = tile.intersection(study_area)
-            tiles.append(clipped_tile)
+            # Create tile and clip to study area to avoid requesting empty space
+            tile_geom = box(x, y, x + config.TILE_SIZE, y + config.TILE_SIZE)
+            clipped_tile = tile_geom.intersection(study_area)
+            if not clipped_tile.is_empty:
+                tiles.append(clipped_tile.bounds) # (minx, miny, maxx, maxy)
             y += step
         x += step
 
     total = len(tiles)
     mode = "TEST" if config.TEST_RUN else "PRODUCTION"
-    print(f"--- {mode} Sync: {total} tiles @ native resolution ---")
+    print(f"--- {mode} PDAL Sync: {total} tiles ---")
 
+    # 3. Processing Loop
     start_time = time.time()
-    for i, tile in enumerate(tiles):
+    for i, (t_minx, t_miny, t_maxx, t_maxy) in enumerate(tiles):
         out_path = config.DATA_RAW / f"gt_{i+1:03}.laz"
 
         if out_path.exists():
             print(f"[{i+1}/{total}] Skipping {out_path.name} (Exists)")
             continue
 
-        tile_start = time.time()
         print(f"[{i+1}/{total}] Downloading {out_path.name}...", end="", flush=True)
+        tile_start = time.time()
 
         try:
-            run_download(tile, str(out_path))
+            # Pass individual tile bounds to the PDAL pipeline
+            run_download_pdal(t_minx, t_maxx, t_miny, t_maxy, str(out_path))
+            
             elapsed = time.time() - tile_start
-            remaining = total - (i + 1)
-            eta_min = (elapsed * remaining) / 60
-            print(f" Done in {elapsed:.1f}s | Est. Remaining: {eta_min:.1f} min")
+            print(f" Done in {elapsed:.1f}s")
         except Exception as e:
-            import traceback
-            print(f" FAILED")
-            traceback.print_exc()
+            print(f" FAILED: {e}")
 
-    print(f"\nTotal Process Complete in {(time.time() - start_time)/60:.2f} minutes.")
+    print(f"\nProcess Complete in {(time.time() - start_time)/60:.2f} minutes.")
