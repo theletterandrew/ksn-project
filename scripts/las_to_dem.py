@@ -49,10 +49,10 @@ INPUT_CRS     = "EPSG:3857"   # Source CRS of the LAS/LAZ files
 OUTPUT_CRS    = "EPSG:26911"  # Target CRS for output GeoTIFFs
                               # EPSG:26911 = NAD83 / UTM Zone 11N (metric, SoCal standard)
 
-RESOLUTION    = 2.0       # Output raster resolution in meters
-NODATA_VALUE  = -9999.0   # NoData fill value
-IDW_POWER     = 2         # IDW distance weighting power for gap filling
-IDW_NEIGHBORS = 8         # Number of nearest neighbors for IDW gap filling
+RESOLUTION    = config.RES      # Output raster resolution in meters
+NODATA_VALUE  = -9999.0         # NoData fill value
+IDW_POWER     = 2               # IDW distance weighting power for gap filling
+IDW_NEIGHBORS = 8               # Number of nearest neighbors for IDW gap filling
 
 # =============================================================================
 # END CONFIG — No edits needed below this line
