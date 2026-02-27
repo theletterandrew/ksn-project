@@ -96,28 +96,64 @@ def setup_logging(output_dir: Path) -> logging.Logger:
     return logging.getLogger(__name__)
 
 
-def run_wbt(tool: str, args: dict, logger: logging.Logger) -> bool:
+def run_wbt(tool: str, args: dict, logger: logging.Logger, timeout: int = 600) -> bool:
     """
     Run a WhiteboxTools command via subprocess.
-    Returns True on success, False on failure (does not exit).
-    Callers are responsible for deciding whether to abort.
+    Streams stdout/stderr in real time so progress is visible immediately.
+    Kills the process and returns False if it exceeds `timeout` seconds.
     """
     cmd = [str(WBT_EXE), f"--run={tool}"]
     for key, val in args.items():
         cmd.append(f"--{key}={val}")
     logger.info(f"  Running WBT tool: {tool}")
+    logger.info(f"  Command: {' '.join(cmd)}")
+
     try:
-        result = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
-        for line in result.stdout.strip().splitlines():
-            logger.info(f"    WBT: {line}")
-        for line in result.stderr.strip().splitlines():
-            logger.warning(f"    WBT ERR: {line}")
-        if result.returncode != 0:
-            logger.error(f"  {tool} failed with return code {result.returncode}")
+
+        import threading
+
+        def stream_output(pipe, log_fn):
+            for line in iter(pipe.readline, ""):
+                line = line.rstrip()
+                if line:
+                    log_fn(f"    WBT: {line}")
+            pipe.close()
+
+        stdout_thread = threading.Thread(
+            target=stream_output, args=(process.stdout, logger.info), daemon=True
+        )
+        stderr_thread = threading.Thread(
+            target=stream_output, args=(process.stderr, logger.warning), daemon=True
+        )
+        stdout_thread.start()
+        stderr_thread.start()
+
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            logger.error(
+                f"  {tool} killed after {timeout}s timeout. "
+                f"Check that pour points overlap the FDR raster and that "
+                f"the WBT executable is not prompting for input."
+            )
             return False
+
+        stdout_thread.join(timeout=5)
+        stderr_thread.join(timeout=5)
+
+        if process.returncode != 0:
+            logger.error(f"  {tool} failed with return code {process.returncode}")
+            return False
+
         return True
+
     except Exception as e:
         logger.error(f"  Failed to run {tool}: {e}")
         return False
