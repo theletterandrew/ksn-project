@@ -63,51 +63,92 @@ def boxes_intersect(a: tuple, b: tuple) -> bool:
     return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
 
 
+def fetch_hierarchy_page(base_url: str, key: str) -> dict:
+    """
+    Fetch a sub-page of the EPT hierarchy.
+    EPT stores deep hierarchy nodes in separate JSON files when the tree
+    is too large to fit in a single 0-0-0-0.json. A node value of -1
+    signals that its children live in a separate page at ept-hierarchy/{key}.json.
+    """
+    url = f"{base_url}/ept-hierarchy/{key}.json"
+    try:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        return response.json()
+    except Exception:
+        return {}
+
+
 def collect_nodes(
     hierarchy: dict,
     ept_bounds: list,
     query_box: tuple,
+    base_url: str,
     d: int = 0,
     x: int = 0,
     y: int = 0,
     z: int = 0,
-    nodes: list = None
+    nodes: list = None,
+    leaf_only: bool = False,
 ) -> list:
     """
-    Recursively traverse the EPT hierarchy to collect all node keys
-    whose bounds intersect the query bounding box.
+    Recursively traverse the EPT hierarchy to collect node keys whose bounds
+    intersect the query bounding box.
 
-    All hierarchy data is in 0-0-0-0.json for this dataset — no sub-page
-    fetching needed. Collects all intersecting nodes at every depth; spatial
-    clipping in run_download handles precise boundary enforcement.
+    EPT hierarchy pagination: when a node's value is -1, its children are
+    stored in a separate hierarchy page at ept-hierarchy/{key}.json. This
+    function fetches those sub-pages on demand so the full tree is traversed
+    down to the highest-resolution leaf nodes.
+
+    leaf_only=True collects only leaf nodes (no children in hierarchy),
+    which avoids double-counting points that appear in both parent and child
+    nodes. Set to False to include all levels (original behaviour).
     """
     if nodes is None:
         nodes = []
 
     key = f"{d}-{x}-{y}-{z}"
 
-    # Skip nodes not in hierarchy (root at d=0 is implied, so skip check)
-    if d > 0:
-        if not hierarchy.get(key):
-            return nodes
-
     # Prune branches that don't intersect our query box (x/y only)
     nb = node_bounds(ept_bounds, d, x, y)
     if not boxes_intersect(nb, query_box):
         return nodes
 
-    # Collect this node (skip root since it has no data file)
-    if d > 0:
-        nodes.append(key)
+    # Check this node's status in the hierarchy
+    # d=0 root is implicit (not in hierarchy dict), treat as present
+    node_val = hierarchy.get(key, 0 if d == 0 else None)
 
-    # Recurse into all 8 children (EPT octree: 2x2x2)
+    if d > 0 and node_val is None:
+        # Node not in hierarchy at all — branch doesn't exist
+        return nodes
+
+    # node_val == -1 means children are in a separate hierarchy sub-page
+    if node_val == -1:
+        sub_page = fetch_hierarchy_page(base_url, key)
+        hierarchy.update(sub_page)
+        node_val = hierarchy.get(key, 0)
+
+    has_children = any(
+        hierarchy.get(f"{d+1}-{x*2+dx}-{y*2+dy}-{z*2+dz}") is not None
+        for dx in range(2) for dy in range(2) for dz in range(2)
+    )
+
+    # Collect this node
+    if d > 0:
+        if leaf_only:
+            if not has_children:
+                nodes.append(key)
+        else:
+            nodes.append(key)
+
+    # Recurse into children
     for dx in range(2):
         for dy in range(2):
             for dz in range(2):
                 collect_nodes(
-                    hierarchy, ept_bounds, query_box,
+                    hierarchy, ept_bounds, query_box, base_url,
                     d + 1, x * 2 + dx, y * 2 + dy, z * 2 + dz,
-                    nodes
+                    nodes, leaf_only,
                 )
 
     return nodes
@@ -141,9 +182,12 @@ def run_download(tile_box, filename: str):
     hierarchy = fetch_json(f"{base_url}/ept-hierarchy/0-0-0-0.json")
 
     # --- Step 2: Find all nodes that intersect our tile ---
-    nodes = collect_nodes(hierarchy, ept_bounds, query_box)
     if hierarchy is None:
         raise ValueError("Failed to fetch EPT hierarchy - got None response.")
+
+    # leaf_only=True fetches only the highest-resolution nodes, avoiding
+    # double-counting points that appear in both parent and child tiles.
+    nodes = collect_nodes(hierarchy, ept_bounds, query_box, base_url, leaf_only=True)
 
     if not nodes:
         raise ValueError(
