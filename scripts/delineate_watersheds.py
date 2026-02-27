@@ -523,6 +523,73 @@ def debug_pour_points(snapped_tif: Path, fdr_path: Path, logger: logging.Logger)
         logger.info(f"    FDR values in 7x7 neighbourhood:\n{window}")
 
 
+
+def _d8_watershed_numpy(
+    fdr_arr: np.ndarray,
+    fdr_nodata,
+    outlet_rows: list,
+    outlet_cols: list,
+) -> np.ndarray:
+    """
+    Pure-numpy D8 watershed delineation via BFS (flood-fill upstream).
+
+    For each outlet, walks backwards up the D8 pointer grid collecting every
+    cell that drains to that outlet. Returns an int32 label array where
+    0 = unassigned and 1..N = watershed ID.
+
+    WBT D8 pointer convention (powers of 2):
+        1=E  2=SE  4=S  8=SW  16=W  32=NW  64=N  128=NE
+
+    To find cells draining INTO (r, c) we check all 8 neighbours: a neighbour
+    at offset (dr, dc) drains into (r, c) when its FDR value equals the
+    direction pointing back toward (r, c), i.e. D8[(-dr, -dc)].
+    """
+    from collections import deque
+
+    nrows, ncols = fdr_arr.shape
+
+    D8 = {
+        ( 0,  1): 1,
+        ( 1,  1): 2,
+        ( 1,  0): 4,
+        ( 1, -1): 8,
+        ( 0, -1): 16,
+        (-1, -1): 32,
+        (-1,  0): 64,
+        (-1,  1): 128,
+    }
+    # (dr, dc, expected_fdr_in_neighbour) — neighbour drains into current cell
+    UPSTREAM = [
+        (dr, dc, D8[(-dr, -dc)])
+        for (dr, dc) in D8
+        if (-dr, -dc) in D8
+    ]
+
+    labels = np.zeros(fdr_arr.shape, dtype=np.int32)
+
+    for ws_id, (out_r, out_c) in enumerate(zip(outlet_rows, outlet_cols), start=1):
+        queue = deque()
+        queue.append((out_r, out_c))
+        labels[out_r, out_c] = ws_id
+
+        while queue:
+            r, c = queue.popleft()
+            for dr, dc, expected_fdr in UPSTREAM:
+                nr, nc = r + dr, c + dc
+                if not (0 <= nr < nrows and 0 <= nc < ncols):
+                    continue
+                if labels[nr, nc] != 0:
+                    continue
+                cell_fdr = int(fdr_arr[nr, nc])
+                if fdr_nodata is not None and cell_fdr == int(fdr_nodata):
+                    continue
+                if cell_fdr == expected_fdr:
+                    labels[nr, nc] = ws_id
+                    queue.append((nr, nc))
+
+    return labels
+
+
 def delineate_and_vectorise(
     fdr_path: Path,
     pour_shp_path: Path,
@@ -531,48 +598,56 @@ def delineate_and_vectorise(
     logger: logging.Logger,
 ) -> gpd.GeoDataFrame:
     """
-    Run WBT watershed delineation using a vector shapefile for pour points
-    (more reliable than a raster across WBT versions), vectorise the result
-    with rasterio, and return a GeoDataFrame with area_km2 attached.
+    Delineate watersheds using a pure-numpy D8 BFS — no WBT Watershed call.
+    Vectorise the result with rasterio and return a GeoDataFrame.
     """
-    logger.info("  Running WBT Watershed tool...")
-    success = run_wbt("Watershed", {
-        "d8_pntr"  : str(fdr_path),
-        "pour_pts" : str(pour_shp_path),
-        "output"   : str(watersheds_tif),
-    }, logger)
-    if not success:
-        logger.error("WBT Watershed tool failed.")
-        sys.exit(1)
-
-    if not watersheds_tif.exists():
-        logger.error(f"WBT Watershed produced no output at {watersheds_tif}.")
-        sys.exit(1)
-
-    logger.info("  Vectorising watershed raster...")
-    with rasterio.open(watersheds_tif) as src:
-        arr       = src.read(1)
-        nodata    = src.nodata
+    logger.info("  Loading FDR raster...")
+    with rasterio.open(fdr_path) as src:
+        fdr_arr   = src.read(1)
+        fdr_nd    = src.nodata
         crs       = src.crs
         transform = src.transform
+        fdr_meta  = src.meta.copy()
 
-    valid_mask = (
-        (arr != nodata).astype(np.uint8)
-        if nodata is not None
-        else np.ones(arr.shape, dtype=np.uint8)
+    pour_gdf = gpd.read_file(str(pour_shp_path))
+    outlet_rows, outlet_cols = [], []
+    for geom in pour_gdf.geometry:
+        col, row = ~transform * (geom.x, geom.y)
+        outlet_rows.append(int(row))
+        outlet_cols.append(int(col))
+
+    logger.info(
+        f"  Running numpy D8 BFS watershed delineation "
+        f"({len(outlet_rows)} outlet(s), "
+        f"{fdr_arr.shape[1]}x{fdr_arr.shape[0]} grid)..."
     )
+    labels = _d8_watershed_numpy(fdr_arr, fdr_nd, outlet_rows, outlet_cols)
 
-    # Use a generator to avoid loading all shapes into memory at once
-    shapes_gen = rasterio.features.shapes(
-        arr.astype(np.int32), mask=valid_mask, transform=transform
-    )
+    labeled_cells = int((labels > 0).sum())
+    logger.info(f"  BFS complete — {labeled_cells:,} cells assigned to watersheds")
 
-    # Silence the rasterio/GDAL 3.11 'Memory' driver deprecation warning —
-    # it is harmless and will be fixed in a future rasterio release.
+    if labeled_cells == 0:
+        logger.error(
+            "BFS returned no watershed cells. Verify the outlet cell has a "
+            "valid non-zero FDR value and lies within the FDR raster extent."
+        )
+        sys.exit(1)
+
+    fdr_meta.update(dtype=rasterio.int32, nodata=0)
+    with rasterio.open(watersheds_tif, "w", **fdr_meta) as dst:
+        dst.write(labels, 1)
+
+    logger.info("  Vectorising watershed raster...")
+    valid_mask = (labels != 0).astype(np.uint8)
+
     warnings.filterwarnings(
         "ignore",
         message=".*Memory.*driver is deprecated.*",
         category=RuntimeWarning,
+    )
+
+    shapes_gen = rasterio.features.shapes(
+        labels.astype(np.int32), mask=valid_mask, transform=transform
     )
 
     geoms, gridcodes = [], []
@@ -581,18 +656,12 @@ def delineate_and_vectorise(
         gridcodes.append(int(val))
 
     if not geoms:
-        logger.error(
-            "Vectorisation produced no polygons — the watershed raster appears empty. "
-            "Check that the pour point raster overlaps the flow direction raster."
-        )
+        logger.error("Vectorisation produced no polygons.")
         sys.exit(1)
 
     gdf = gpd.GeoDataFrame({"gridcode": gridcodes}, geometry=geoms, crs=crs)
-
-    # Dissolve so each watershed ID becomes a single polygon
     gdf = gdf.dissolve(by="gridcode").reset_index()
 
-    # Sanity-check the first polygon's area
     raw_area = gdf.geometry.area.iloc[0]
     logger.info(
         f"  First polygon raw area: {raw_area:,.0f} CRS units\u00b2 "
@@ -601,17 +670,13 @@ def delineate_and_vectorise(
 
     if raw_area < 1:
         logger.error(
-            "  Polygon area is effectively zero. The watershed raster likely "
-            "contains only a single cell or the geometry was not reprojected. "
-            "Verify that the FDR and pour point rasters share the same CRS and "
-            "that the outlet cell is not on the raster boundary."
+            "Polygon area is effectively zero — check FDR raster and outlet location."
         )
         sys.exit(1)
 
     gdf["area_km2"] = gdf.geometry.area / 1e6
     gdf.to_file(watersheds_shp)
     return gdf
-
 
 def main():
     output_dir = Path(OUTPUT_DIR)
