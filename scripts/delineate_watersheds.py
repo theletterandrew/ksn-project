@@ -487,6 +487,44 @@ def main():
     )
     logger.info("-" * 60)
 
+    # ------------------------------------------------------------------
+    # FAC raster sanity check — runs before any endpoint logic so a bad
+    # raster is caught immediately with actionable numbers.
+    # ------------------------------------------------------------------
+    logger.info("Checking FAC raster integrity...")
+    with rasterio.open(fac_path) as src:
+        _fac_arr  = src.read(1).astype(np.float64)
+        _fac_nd   = src.nodata
+        _fac_res  = src.res
+        _fac_shape = src.shape
+    if _fac_nd is not None:
+        _fac_valid = _fac_arr[_fac_arr != _fac_nd]
+    else:
+        _fac_valid = _fac_arr.flatten()
+    _fac_valid = _fac_valid[_fac_valid > 0]
+    if _fac_valid.size == 0:
+        logger.error(
+            "FAC raster contains no positive values — "
+            "wbt_hydrology.py may not have run successfully. "
+            f"Raster: {fac_path}"
+        )
+        sys.exit(1)
+    logger.info(
+        f"  FAC raster : {_fac_shape[1]}x{_fac_shape[0]} px @ {_fac_res[0]:.1f}m  "
+        f"valid cells={_fac_valid.size:,}  "
+        f"max={_fac_valid.max():,.0f}  "
+        f"p99={np.percentile(_fac_valid, 99):,.0f}  "
+        f"p50={np.percentile(_fac_valid, 50):,.0f}"
+    )
+    _expected_max = (_fac_shape[0] * _fac_shape[1]) * 0.5   # rough lower bound
+    if _fac_valid.max() < _expected_max * 0.001:
+        logger.warning(
+            f"  FAC maximum ({_fac_valid.max():,.0f}) looks suspiciously low for a "
+            f"{_fac_shape[1]}x{_fac_shape[0]} raster. The flow accumulation may not "
+            f"have been computed correctly — check wbt_hydrology.py outputs."
+        )
+    del _fac_arr, _fac_valid  # free memory before processing
+
     start_time = time.time()
 
     # ------------------------------------------------------------------
