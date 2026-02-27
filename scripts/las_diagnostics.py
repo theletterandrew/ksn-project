@@ -89,10 +89,16 @@ def run_lasinfo(las_path: Path, logger: logging.Logger):
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, timeout=120,
         )
-        if result.returncode != 0:
-            logger.error(f"  lasinfo64 failed for {las_path.name}: {result.stderr.strip()}")
-            return None
-        return result.stdout
+        # LAStools prints CRS warnings for EPSG:3857 to stderr but still
+        # produces valid point/classification output. Treat any output on
+        # stdout as success; only fail if stdout is genuinely empty.
+        if result.stdout.strip():
+            if result.stderr.strip():
+                logger.warning(f"  lasinfo64 warnings for {las_path.name}: {result.stderr.strip()}")
+            return result.stdout
+        # stdout is empty — genuine failure
+        logger.error(f"  lasinfo64 failed for {las_path.name}: {result.stderr.strip()}")
+        return None
     except subprocess.TimeoutExpired:
         logger.error(f"  lasinfo64 timed out for {las_path.name}")
         return None
@@ -273,8 +279,7 @@ def main():
             "Ground density is low. Consider using USGS 3DEP 10m data as a base layer, "
             "or lower STREAM_THRESHOLD to match resolution."
         )
-    input("las_diagnostics.py complete — press Enter to continue...")
-
+    input("Las Diagnostics.py complete (Press Enter to Continue)")
 
 if __name__ == "__main__":
     main()
