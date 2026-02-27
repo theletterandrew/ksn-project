@@ -18,7 +18,7 @@ Requirements:
     - geopandas   (pip install geopandas)
     - rasterio    (pip install rasterio)
     - numpy       (pip install numpy)
-    - WhiteboxTools executable on PATH or configured via config.WBT_EXE
+    - WhiteboxTools v2.4.0+ executable configured via config.WBT_EXE
     - Completed wbt_hydrology.py and stream_extraction_wbt.py first
     - streams_connected.gpkg produced by stream_extraction_wbt.py
 """
@@ -69,11 +69,11 @@ FAC_FILE   = WBT_DIR / "flow_accumulation.tif" # WBT flow accumulation
 MIN_DRAINAGE_AREA_CELLS = config.MIN_WATERSHED_AREA  # ~40 km² at 2m resolution
 
 # Snap distance for pour points (cells).
-# Pour points are snapped to the highest flow accumulation cell within
-# this distance to ensure they land exactly on the stream.
+# WBT SnapPourPoints expects map units, so this is multiplied by cell size
+# internally. 50 cells * 2m = 100m snap radius.
 SNAP_DISTANCE = config.SNAP_DISTANCE  # cells (e.g. 50 cells = 100 m at 2 m resolution)
 
-# Set to True to print per-cell FDR diagnostics around the snapped pour point.
+# Set to True to log FDR diagnostics around the snapped pour point.
 # Useful when WBT Watershed returns an empty result; disable for production runs.
 DEBUG_POUR_POINTS = False
 
@@ -96,28 +96,64 @@ def setup_logging(output_dir: Path) -> logging.Logger:
     return logging.getLogger(__name__)
 
 
-def run_wbt(tool: str, args: dict, logger: logging.Logger) -> bool:
+def run_wbt(tool: str, args: dict, logger: logging.Logger, timeout: int = 600) -> bool:
     """
     Run a WhiteboxTools command via subprocess.
-    Returns True on success, False on failure (does not exit).
-    Callers are responsible for deciding whether to abort.
+    Streams stdout/stderr in real time so progress is visible immediately.
+    Kills the process and returns False if it exceeds `timeout` seconds.
     """
     cmd = [str(WBT_EXE), f"--run={tool}"]
     for key, val in args.items():
         cmd.append(f"--{key}={val}")
     logger.info(f"  Running WBT tool: {tool}")
+    logger.info(f"  Command: {' '.join(cmd)}")
+
     try:
-        result = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        import threading
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
-        for line in result.stdout.strip().splitlines():
-            logger.info(f"    WBT: {line}")
-        for line in result.stderr.strip().splitlines():
-            logger.warning(f"    WBT ERR: {line}")
-        if result.returncode != 0:
-            logger.error(f"  {tool} failed with return code {result.returncode}")
+
+        def stream_output(pipe, log_fn):
+            for line in iter(pipe.readline, ""):
+                line = line.rstrip()
+                if line:
+                    log_fn(f"    WBT: {line}")
+            pipe.close()
+
+        stdout_thread = threading.Thread(
+            target=stream_output, args=(process.stdout, logger.info), daemon=True
+        )
+        stderr_thread = threading.Thread(
+            target=stream_output, args=(process.stderr, logger.warning), daemon=True
+        )
+        stdout_thread.start()
+        stderr_thread.start()
+
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            logger.error(
+                f"  {tool} killed after {timeout}s timeout. "
+                f"Check that pour points overlap the FDR raster and that "
+                f"the WBT executable is not prompting for input."
+            )
             return False
+
+        stdout_thread.join(timeout=5)
+        stderr_thread.join(timeout=5)
+
+        if process.returncode != 0:
+            logger.error(f"  {tool} failed with return code {process.returncode}")
+            return False
+
         return True
+
     except Exception as e:
         logger.error(f"  Failed to run {tool}: {e}")
         return False
@@ -149,7 +185,56 @@ def sample_raster_at_points(
     return gdf
 
 
-def points_to_raster(
+def snap_pour_points_wbt(
+    points_gdf: gpd.GeoDataFrame,
+    fac_path: Path,
+    snap_distance_cells: int,
+    cell_size: float,
+    temp_shp: Path,
+    snapped_tif: Path,
+    logger: logging.Logger,
+) -> None:
+    """
+    Snap pour points to the nearest high-accumulation stream cell using WBT's
+    own SnapPourPoints tool, then burn the result to a raster for Watershed.
+
+    Using WBT's native vector snapping is more reliable than the numpy raster
+    approach because it avoids the int32/float64 dtype mismatch that causes
+    WBT Watershed to hang silently on some builds.
+
+    snap_distance_cells * cell_size converts the cell-based snap distance to
+    map units, which is what WBT SnapPourPoints expects.
+    """
+    snap_dist_m = snap_distance_cells * cell_size
+
+    # Write the pour points to a temporary shapefile for WBT
+    points_gdf[["POUR_ID", "geometry"]].to_file(str(temp_shp))
+    logger.info(f"  Written {len(points_gdf)} pour point(s) to {temp_shp.name}")
+
+    snapped_shp = temp_shp.with_name("pourpoints_snapped.shp")
+
+    success = run_wbt("SnapPourPoints", {
+        "pour_pts"  : str(temp_shp),
+        "flow_accum": str(fac_path),
+        "output"    : str(snapped_shp),
+        "snap_dist" : snap_dist_m,
+    }, logger)
+
+    if not success or not snapped_shp.exists():
+        logger.warning(
+            "  WBT SnapPourPoints failed — falling back to unsnapped pour points. "
+            "Watershed result may be inaccurate if points are not on stream cells."
+        )
+        snapped_shp = temp_shp
+
+    # Burn snapped vector points to a raster aligned with the FAC grid
+    snapped_gdf = gpd.read_file(str(snapped_shp))
+    snapped_gdf["POUR_ID"] = range(1, len(snapped_gdf) + 1)
+    _points_to_raster(snapped_gdf, "POUR_ID", fac_path, snapped_tif)
+    logger.info(f"  Snapped pour point raster written: {snapped_tif.name}")
+
+
+def _points_to_raster(
     points_gdf: gpd.GeoDataFrame,
     value_col: str,
     ref_raster_path: Path,
@@ -159,6 +244,9 @@ def points_to_raster(
     Burn point values into a new raster whose grid exactly matches the
     reference raster. Using the WBT FAC as the reference guarantees cell
     alignment with every other WBT-produced raster in the pipeline.
+
+    Written as float64 — WBT Watershed hangs silently on int32 pour point
+    rasters in some v2.4.0 builds.
     """
     with rasterio.open(ref_raster_path) as src:
         meta      = src.meta.copy()
@@ -172,72 +260,15 @@ def points_to_raster(
         col_idx, row_idx = ~transform * (row.geometry.x, row.geometry.y)
         col_idx, row_idx = int(col_idx), int(row_idx)
         if 0 <= row_idx < arr_shape[0] and 0 <= col_idx < arr_shape[1]:
-            out_arr[row_idx, col_idx] = int(row[value_col])
+            out_arr[row_idx, col_idx] = float(row[value_col])
 
     with rasterio.open(out_path, "w", **meta) as dst:
         dst.write(out_arr, 1)
 
 
-def snap_pour_points(
-    pour_raster_path: Path,
-    fac_path: Path,
-    snap_distance: int,
-    out_path: Path,
-    logger: logging.Logger,
-) -> None:
-    """
-    For each labelled cell in the pour raster, locate the cell with the
-    highest flow accumulation within snap_distance cells and move the pour
-    point there. Pure numpy — no arcpy required, no grid mismatch possible
-    because both inputs come from the same WBT pipeline.
-    """
-    with rasterio.open(pour_raster_path) as src:
-        pour_arr = src.read(1).astype(np.float64)
-        nodata   = float(src.nodata) if src.nodata is not None else -9999.0
-        meta     = src.meta.copy()
-
-    # Update meta to float64 — WBT Watershed hangs silently on int32 pour points
-    meta.update(dtype=rasterio.float64, nodata=-9999.0)
-
-    # Use float32 for FAC — halves memory vs float64 with no precision impact
-    # for the argmax comparison we do here.
-    with rasterio.open(fac_path) as src:
-        fac_arr = src.read(1).astype(np.float32)
-        fac_nd  = src.nodata
-
-    if fac_nd is not None:
-        fac_arr[fac_arr == fac_nd] = -1.0
-
-    snapped = np.full(pour_arr.shape, -9999.0, dtype=np.float64)
-    pour_rows, pour_cols = np.where(pour_arr != nodata)
-
-    if len(pour_rows) == 0:
-        logger.error(
-            "Pour point raster contains no valid cells. "
-            "Verify that stream endpoints fall within the FAC raster extent "
-            "and that both datasets share the same CRS."
-        )
-        sys.exit(1)
-
-    for r, c in zip(pour_rows, pour_cols):
-        val = pour_arr[r, c]
-        r0  = max(0, r - snap_distance)
-        r1  = min(fac_arr.shape[0], r + snap_distance + 1)
-        c0  = max(0, c - snap_distance)
-        c1  = min(fac_arr.shape[1], c + snap_distance + 1)
-        window = fac_arr[r0:r1, c0:c1]
-        best   = np.unravel_index(np.argmax(window), window.shape)
-        snapped[r0 + best[0], c0 + best[1]] = val
-
-    logger.info(f"  Snapped {len(pour_rows)} pour point(s) within {snap_distance} cells")
-
-    with rasterio.open(out_path, "w", **meta) as dst:
-        dst.write(snapped, 1)
-
-
 def debug_pour_points(snapped_tif: Path, fdr_path: Path, logger: logging.Logger) -> None:
     """
-    Print FDR diagnostics for every snapped pour point cell.
+    Log FDR diagnostics for every snapped pour point cell.
     Only called when DEBUG_POUR_POINTS = True.
     """
     with rasterio.open(snapped_tif) as src:
@@ -253,7 +284,10 @@ def debug_pour_points(snapped_tif: Path, fdr_path: Path, logger: logging.Logger)
     for r, c in zip(rows, cols):
         x, y    = transform * (c, r)
         fdr_val = fdr_arr[r, c]
-        logger.info(f"  Pour point ID={snapped_arr[r, c]} at row={r}, col={c}, coords=({x:.1f}, {y:.1f})")
+        logger.info(
+            f"  Pour point ID={snapped_arr[r, c]} at "
+            f"row={r}, col={c}, coords=({x:.1f}, {y:.1f})"
+        )
         if fdr_val == 0:
             logger.warning(f"    FDR={fdr_val} — pour point is on a zero/flat cell!")
         elif fdr_nodata is not None and fdr_val == fdr_nodata:
@@ -335,7 +369,7 @@ def delineate_and_vectorise(
     # Sanity-check the first polygon's area
     raw_area = gdf.geometry.area.iloc[0]
     logger.info(
-        f"  First polygon raw area: {raw_area:,.0f} CRS units² "
+        f"  First polygon raw area: {raw_area:,.0f} CRS units\u00b2 "
         f"(CRS: {crs.to_string() if crs else 'unknown'})"
     )
 
@@ -392,9 +426,12 @@ def main():
 
     logger.info(
         f"Min drainage area : {MIN_DRAINAGE_AREA_CELLS:,} cells "
-        f"@ {cell_w:.1f}m resolution = ~{min_area_km2:.2f} km²"
+        f"@ {cell_w:.1f}m resolution = ~{min_area_km2:.2f} km\u00b2"
     )
-    logger.info(f"Snap distance     : {SNAP_DISTANCE} cells ({SNAP_DISTANCE * cell_w:.0f} m)")
+    logger.info(
+        f"Snap distance     : {SNAP_DISTANCE} cells "
+        f"({SNAP_DISTANCE * cell_w:.0f} m)"
+    )
     logger.info("-" * 60)
 
     start_time = time.time()
@@ -422,32 +459,28 @@ def main():
         sys.exit(1)
 
     # Keep only the single outlet with the highest flow accumulation
-    primary        = endpoints.sort_values("fac_value", ascending=False).iloc[[0]].copy()
+    primary           = endpoints.sort_values("fac_value", ascending=False).iloc[[0]].copy()
     primary["POUR_ID"] = 1
-    primary_accum  = int(primary["fac_value"].iloc[0])
+    primary_accum     = int(primary["fac_value"].iloc[0])
     logger.info(f"  Primary outlet identified (Accumulation: {primary_accum:,} cells)")
 
     # ------------------------------------------------------------------
-    # Step 2: Burn pour point to raster aligned with WBT FAC, then snap
+    # Step 2: Snap pour point with WBT SnapPourPoints, then rasterise
     # ------------------------------------------------------------------
-    logger.info("Step 2: Rasterising and snapping pour point...")
+    logger.info("Step 2: Snapping pour point with WBT SnapPourPoints...")
 
-    temp_pour_raster = output_dir / "temp_pour_points.tif"
-    snapped_tif      = output_dir / "pourpoints_snapped.tif"
+    temp_shp    = output_dir / "temp_pour_points.shp"
+    snapped_tif = output_dir / "pourpoints_snapped.tif"
 
-    points_to_raster(primary, "POUR_ID", fac_path, temp_pour_raster)
-    snap_pour_points(temp_pour_raster, fac_path, SNAP_DISTANCE, snapped_tif, logger)
+    snap_pour_points_wbt(
+        primary, fac_path, SNAP_DISTANCE, cell_w,
+        temp_shp, snapped_tif, logger
+    )
 
-    # Temporary debug section
-    import rasterio
-    with rasterio.open(snapped_tif) as src:
-        print(f"snapped dtype : {src.dtypes[0]}")
-        print(f"snapped nodata: {src.nodata}")
-        arr = src.read(1)
-        valid = arr[arr != src.nodata]
-        print(f"valid cells   : {len(valid)}")
-        print(f"unique values : {valid}")
-    temp_pour_raster.unlink(missing_ok=True)
+    # Clean up all sidecar files produced by the shapefile write
+    for ext in [".shp", ".shx", ".dbf", ".prj", ".cpg"]:
+        for stem in ["temp_pour_points", "pourpoints_snapped"]:
+            (output_dir / f"{stem}{ext}").unlink(missing_ok=True)
 
     # ------------------------------------------------------------------
     # Optional FDR diagnostics — set DEBUG_POUR_POINTS = True in CONFIG
@@ -457,7 +490,7 @@ def main():
         debug_pour_points(snapped_tif, fdr_path, logger)
 
     # ------------------------------------------------------------------
-    # Step 3 & 4: WBT watershed delineation → vectorise → area stats
+    # Step 3 & 4: WBT watershed delineation -> vectorise -> area stats
     # ------------------------------------------------------------------
     logger.info("Step 3: Delineating watershed with WhiteboxTools...")
 
@@ -478,7 +511,7 @@ def main():
     for _, row in gdf.iterrows():
         logger.info(
             f"  Watershed {int(row['gridcode'])}: "
-            f"{row.geometry.area:,.0f} m²  ({row['area_km2']:.2f} km²)"
+            f"{row.geometry.area:,.0f} m\u00b2  ({row['area_km2']:.2f} km\u00b2)"
         )
 
     # ------------------------------------------------------------------
