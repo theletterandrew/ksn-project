@@ -104,31 +104,43 @@ def main():
         raw = run_lasinfo(f, logger)
         s = parse_lasinfo(raw, f.name)
         if s:
-            flag = " !!" if s["rec_res"] > 5.0 else ""
-            logger.info(
-                f"{s['file']:<25s} | {s['ground_count']:>10,} | "
-                f"{s['density']:>8.2f} | {s['rec_res']:>6.1f} m{flag}"
-            )
+            # Check if tile is empty to avoid local rec_res issues
+            if s["ground_count"] == 0:
+                logger.warning(f"{s['file']:<25s} | {'0':>10s} | {'0.00':>8s} | {'EMPTY':>8s} !!")
+                # We still append to all_stats to keep track of area, 
+                # but handle density carefully
+            else:
+                flag = " !!" if s["rec_res"] > 5.0 else ""
+                logger.info(
+                    f"{s['file']:<25s} | {s['ground_count']:>10,} | "
+                    f"{s['density']:>8.2f} | {s['rec_res']:>6.1f} m{flag}"
+                )
             all_stats.append(s)
 
-    # Summary
+    # --- Summary Logic Fix ---
     if not all_stats: return
     
     total_pts = sum(s["ground_count"] for s in all_stats)
     total_area = sum(s["area_m2"] for s in all_stats)
-    avg_density = total_pts / total_area
-    avg_res = (TARGET_POINTS_PER_CELL / avg_density) ** 0.5
-
+    
+    # Check for total density to avoid ZeroDivisionError
+    avg_density = total_pts / total_area if total_area > 0 else 0
+    
     logger.info("=" * 70)
     logger.info(f"SUMMARY")
     logger.info(f"  Total Area        : {total_area/1e6:.2f} km2")
     logger.info(f"  Total Ground Pts  : {total_pts:,}")
-    logger.info(f"  Overall Density   : {avg_density:.2f} pts/m2")
-    logger.info(f"  Suggested Grid    : {avg_res:.1f} m (Config uses {config.RES} m)")
-    
-    if avg_res > config.RES:
-        logger.warning(f"  WARNING: Ground density suggests a coarser grid ({avg_res:.1f}m) "
-                       f"than your config.RES ({config.RES}m).")
+
+    if avg_density > 0:
+        avg_res = (TARGET_POINTS_PER_CELL / avg_density) ** 0.5
+        logger.info(f"  Overall Density   : {avg_density:.2f} pts/m2")
+        logger.info(f"  Suggested Grid    : {avg_res:.1f} m (Config uses {config.RES} m)")
+        
+        if avg_res > config.RES:
+            logger.warning(f"  WARNING: Ground density suggests a coarser grid ({avg_res:.1f}m) "
+                           f"than your config.RES ({config.RES}m).")
+    else:
+        logger.error("  FAILED: No ground points found across any tiles. Check your EPT_URL or BOUNDS.")
 
 if __name__ == "__main__":
     main()
