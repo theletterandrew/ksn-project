@@ -24,7 +24,7 @@ def run_download_pdal(minx, maxx, miny, maxy, filename: str):
             "type": "readers.ept",
             "filename": config.EPT_URL,
             "bounds": pdal_bounds,
-            "resolution": 0.01  # Native resolution
+            "resolution": config.RES
         },
         {
             "type": "filters.range",
