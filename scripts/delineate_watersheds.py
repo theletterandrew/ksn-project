@@ -159,45 +159,61 @@ def run_wbt(tool: str, args: dict, logger: logging.Logger, timeout: int = 600) -
         return False
 
 
-def extract_stream_endpoints(streams_gpkg: Path) -> gpd.GeoDataFrame:
+def extract_stream_endpoints(streams_gpkg: Path, fac_path: Path) -> gpd.GeoDataFrame:
     """
     Return a GeoDataFrame of candidate outlet points from the stream network
     GeoPackage.
 
     For LineString / MultiLineString geometries (the typical output of
-    stream_extraction_wbt.py) we extract the true downstream endpoint of each
-    segment — i.e. the last coordinate of each line — because that is the cell
-    most likely to have a high flow-accumulation value and to sit exactly on a
-    stream cell in the WBT rasters.
+    stream_extraction_wbt.py) we extract BOTH endpoints of every segment,
+    sample the FAC raster at each, and keep whichever end has the higher flow
+    accumulation value. This is robust to lines being stored in either
+    source->mouth or mouth->source order.
 
-    For Polygon geometries (stream corridor footprints from older versions of
-    the pipeline) we fall back to the polygon centroid, which is the previous
-    behaviour.
+    For Polygon geometries (stream corridor footprints from older pipeline
+    versions) we fall back to the polygon centroid.
 
     Every candidate point is returned; the caller is responsible for filtering
     to those that exceed the minimum drainage-area threshold.
     """
-    streams = gpd.read_file(streams_gpkg, layer="streams")
+    from shapely.geometry import MultiLineString, Point
+
+    streams   = gpd.read_file(streams_gpkg, layer="streams")
     geom_type = streams.geometry.geom_type.iloc[0] if not streams.empty else "Unknown"
 
-    if "Line" in geom_type:
-        # Extract the last vertex of each line as the downstream outlet point.
-        # For MultiLineString we use the last vertex of the last component.
-        def _last_point(geom):
-            from shapely.geometry import MultiLineString
-            if isinstance(geom, MultiLineString):
-                coords = list(geom.geoms[-1].coords)
-            else:
-                coords = list(geom.coords)
-            return gpd.points_from_xy([coords[-1][0]], [coords[-1][1]])[0]
-
-        end_geoms = streams.geometry.apply(_last_point)
-    else:
+    if "Line" not in geom_type:
         # Fallback for Polygon corridor footprints
         end_geoms = streams.geometry.centroid
+        return gpd.GeoDataFrame(geometry=end_geoms, crs=streams.crs).reset_index(drop=True)
 
-    return gpd.GeoDataFrame(geometry=end_geoms, crs=streams.crs).reset_index(drop=True)
+    # Build two candidate points per segment: first and last vertex
+    def _endpoints(geom):
+        if isinstance(geom, MultiLineString):
+            all_coords = [c for part in geom.geoms for c in part.coords]
+        else:
+            all_coords = list(geom.coords)
+        return Point(all_coords[0]), Point(all_coords[-1])
 
+    firsts, lasts = zip(*[_endpoints(g) for g in streams.geometry])
+
+    # Sample FAC at both ends in a single rasterio pass
+    with rasterio.open(fac_path) as src:
+        nodata    = src.nodata
+        fac_first = [v[0] for v in src.sample([(p.x, p.y) for p in firsts])]
+        fac_last  = [v[0] for v in src.sample([(p.x, p.y) for p in lasts])]
+
+    # For each segment pick the end with the higher FAC value.
+    # If both are nodata/zero, default to the last vertex (original behaviour).
+    chosen = []
+    for f_pt, l_pt, f_val, l_val in zip(firsts, lasts, fac_first, fac_last):
+        f_ok = (nodata is None or f_val != nodata) and f_val > 0
+        l_ok = (nodata is None or l_val != nodata) and l_val > 0
+        if f_ok and (not l_ok or f_val > l_val):
+            chosen.append(f_pt)
+        else:
+            chosen.append(l_pt)
+
+    return gpd.GeoDataFrame(geometry=chosen, crs=streams.crs).reset_index(drop=True)
 
 def sample_raster_at_points(
     raster_path: Path, points_gdf: gpd.GeoDataFrame, col_name: str
@@ -467,14 +483,20 @@ def main():
     # ------------------------------------------------------------------
     logger.info("Step 1: Identifying all qualifying stream outlets...")
 
-    endpoints = extract_stream_endpoints(streams_shp)
-    endpoints = sample_raster_at_points(fac_path, endpoints, "fac_value")
+    # extract_stream_endpoints now samples FAC internally and picks the
+    # higher-accumulation end of each line, so no separate sampling step needed.
+    endpoints = extract_stream_endpoints(streams_shp, fac_path)
 
-    # Drop any points that landed outside the raster (returned nodata)
+    # Drop any points whose chosen end still landed outside the raster
     with rasterio.open(fac_path) as src:
         fac_nodata = src.nodata
+        coords     = [(g.x, g.y) for g in endpoints.geometry]
+        fac_vals   = [v[0] for v in src.sample(coords)]
+
+    endpoints["fac_value"] = fac_vals
     if fac_nodata is not None:
         endpoints = endpoints[endpoints["fac_value"] != fac_nodata]
+    endpoints = endpoints[endpoints["fac_value"] > 0]
 
     if endpoints.empty:
         logger.error(
@@ -484,9 +506,17 @@ def main():
         )
         sys.exit(1)
 
-    # Keep every outlet whose flow accumulation meets the minimum drainage-area
-    # threshold — this tiles the whole DEM into sub-basins rather than
-    # delineating only the main-stem watershed.
+    # Diagnostic: show the FAC distribution so threshold problems are obvious
+    fac_series = endpoints["fac_value"]
+    logger.info(
+        f"  Endpoint FAC stats — n={len(fac_series)}  "
+        f"min={fac_series.min():,.0f}  "
+        f"median={fac_series.median():,.0f}  "
+        f"max={fac_series.max():,.0f}  "
+        f"(threshold={MIN_DRAINAGE_AREA_CELLS:,})"
+    )
+
+    # Keep every outlet whose FAC meets the minimum drainage-area threshold.
     primary = (
         endpoints[endpoints["fac_value"] >= MIN_DRAINAGE_AREA_CELLS]
         .sort_values("fac_value", ascending=False)
@@ -497,8 +527,9 @@ def main():
         logger.error(
             f"No stream endpoints exceeded the minimum drainage-area threshold "
             f"({MIN_DRAINAGE_AREA_CELLS:,} cells). "
-            f"Lower MIN_WATERSHED_AREA in config.py or check that the stream "
-            f"network overlaps the FAC raster."
+            f"The highest FAC value seen was {fac_series.max():,.0f} cells. "
+            f"Either lower MIN_WATERSHED_AREA in config.py, or verify that the "
+            f"stream network and FAC raster share the same CRS and extent."
         )
         sys.exit(1)
 
