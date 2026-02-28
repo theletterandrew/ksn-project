@@ -276,17 +276,13 @@ def extract_stream_points(
     #    the pointer direction, not an exact accumulation value.
     # ------------------------------------------------------------------
     with rasterio.open(str(fdr_path)) as fdr_src:
-        fdr_raw    = np.zeros(dem.shape, dtype=np.int32)
+        if fdr_src.transform != transform or fdr_src.shape != dem.shape:
+            raise RuntimeError(
+                f"Pre-clipped FDR grid does not match DEM grid. "
+                f"Re-run clip_watersheds.py."
+            )
+        fdr_raw    = fdr_src.read(1).astype(np.int32)
         fdr_nodata = fdr_src.nodata
-        reproject(
-            source=rasterio.band(fdr_src, 1),
-            destination=fdr_raw,
-            src_transform=fdr_src.transform,
-            src_crs=fdr_src.crs,
-            dst_transform=transform,
-            dst_crs=crs,
-            resampling=Resampling.nearest,
-        )
 
     # ------------------------------------------------------------------
     # 5. Compute slope with nodata-aware smoothing
