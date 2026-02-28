@@ -335,7 +335,31 @@ def extract_stream_points(
     sampled_cells = _trace_channel_ordered(
         outlet_rc, upstream, sample_dist, cellsize
     )
+    from scipy.ndimage import label as nd_label
+    labeled, n_components = nd_label(valid_stream_mask)
+    logger.info(f"  Connected components in stream mask: {n_components}")
+    logger.info(f"  BFS visited {len(sampled_cells)} sample points from outlet")
 
+    # Check which components the BFS visited vs missed
+    visited_set = set(sampled_cells)
+    visited_components = set(labeled[r, c] for r, c in visited_set if labeled[r, c] > 0)
+    all_components     = set(range(1, n_components + 1))
+    missed_components  = all_components - visited_components
+    logger.info(f"  BFS visited components: {len(visited_components)}")
+    logger.info(f"  BFS missed components : {len(missed_components)}")
+
+    # For each missed component, log its size and FAC range
+    if missed_components:
+        for comp_id in sorted(missed_components)[:5]:  # show first 5
+            comp_mask  = labeled == comp_id
+            comp_size  = int(comp_mask.sum())
+            comp_rows, comp_cols = np.where(comp_mask)
+            comp_fac   = fac[comp_rows, comp_cols]
+            logger.info(
+                f"    Missed component {comp_id}: "
+                f"{comp_size} cells, "
+                f"FAC range {comp_fac.min():.0f}–{comp_fac.max():.0f}"
+            )
     if not sampled_cells:
         logger.warning("  Channel tracing produced no sample points")
         return None
