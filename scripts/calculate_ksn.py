@@ -4,16 +4,15 @@ calculate_ksn.py
 Calculates normalized channel steepness index (ksn) for watershed DEMs
 using direct raster operations with numpy/scipy/rasterio.
 
-Uses per-watershed FAC rasters produced by clip_watersheds.py (which are
-grid-aligned to their DEM), eliminating the reprojection that caused
-spurious stream points in previous versions.
+Uses per-watershed DEM, FAC, and FDR rasters produced by clip_watersheds.py,
+all on identical grids. No reprojection is performed anywhere in this script.
 
 ksn = slope * (drainage_area ^ theta)   where theta = REFERENCE_CONCAVITY
 
 Exports results as point shapefiles with ksn, slope, and area_km2 attributes.
 
 USAGE:
-    1. Run clip_watersheds.py first to produce per-watershed DEM and FAC files.
+    1. Run clip_watersheds.py first to produce per-watershed DEM, FAC, FDR files.
     2. Run:
        python calculate_ksn.py
 
@@ -30,7 +29,6 @@ from pathlib import Path
 import numpy as np
 import rasterio
 import rasterio.transform
-from rasterio.warp import reproject, Resampling
 from scipy.ndimage import generic_filter
 import geopandas as gpd
 from shapely.geometry import Point
@@ -46,10 +44,8 @@ import config
 # CONFIG — Edit these before running
 # =============================================================================
 
-WATERSHED_DEMS_DIR = config.DATA_WATERSHEDS      # Watershed DEMs + per-watershed FAC rasters
-OUTPUT_DIR         = config.DATA_KSN             # Output ksn shapefiles
-
-
+WATERSHED_DEMS_DIR = config.DATA_WATERSHEDS   # Watershed DEMs + FAC + FDR rasters
+OUTPUT_DIR         = config.DATA_KSN          # Output ksn shapefiles
 
 # Ksn calculation parameters
 MIN_DRAINAGE_AREA_M2 = config.MIN_DRAINAGE_AREA_M2
@@ -198,9 +194,9 @@ def extract_stream_points(
     """
     Extract ksn sample points for a single watershed.
 
-    fac_path must be a per-watershed FAC raster produced by
-    clip_watersheds.py, grid-aligned to dem_path. No reprojection
-    of the FAC is performed — a grid mismatch raises immediately.
+    All three rasters (dem, fac, fdr) must be pre-clipped by
+    clip_watersheds.py and share an identical grid. No reprojection
+    is performed — a grid mismatch raises immediately.
     """
     # ------------------------------------------------------------------
     # 1. Load watershed DEM
@@ -213,15 +209,14 @@ def extract_stream_points(
         nodata    = src.nodata
 
     # ------------------------------------------------------------------
-    # 2. Load per-watershed FAC — must be grid-aligned to DEM.
-    #    clip_watersheds.py guarantees this; raise clearly if violated.
+    # 2. Load per-watershed FAC — must be grid-aligned to DEM
     # ------------------------------------------------------------------
     with rasterio.open(str(fac_path)) as fac_src:
         if fac_src.transform != transform or fac_src.shape != dem.shape:
             raise RuntimeError(
                 f"Pre-clipped FAC grid does not match DEM grid. "
                 f"FAC: {fac_src.shape} | DEM: {dem.shape}. "
-                f"Re-run clip_watersheds.py to regenerate the FAC clip."
+                f"Re-run clip_watersheds.py."
             )
         fac        = fac_src.read(1).astype(np.float32)
         fac_nodata = fac_src.nodata
@@ -250,31 +245,15 @@ def extract_stream_points(
     if not stream_mask.any():
         logger.warning("  No stream cells above threshold")
         return None
-    
-    # DIAGNOSTIC — remove after diagnosis
-    logger.info(f"  dem shape: {dem.shape}, nodata: {nodata}")
-    logger.info(f"  dem nodata cells: {(dem == nodata).sum() if nodata is not None else 0:,}")
-    logger.info(f"  dem_valid cells: {dem_valid.sum():,}")
-    logger.info(f"  fac > 0 cells: {(fac > 0).sum():,}")
-    logger.info(f"  area_m2 >= threshold cells: {(area_m2 >= min_area_m2).sum():,}")
-    logger.info(f"  stream_mask cells (after dem_valid): {stream_mask.sum():,}")
-    # Sample some off-network stream_mask cells
-    off_network = stream_mask & ~dem_valid
-    logger.info(f"  stream_mask cells outside dem_valid: {off_network.sum():,}")
-    # Check FAC values at nodata DEM locations
-    if nodata is not None:
-        fac_at_nodata = fac[dem == nodata]
-        logger.info(f"  FAC at DEM nodata cells — min: {fac_at_nodata.min():.0f}  max: {fac_at_nodata.max():.0f}  nonzero: {(fac_at_nodata != 0).sum():,}")
 
     # ------------------------------------------------------------------
-    # 4. Load full-mosaic FDR, reprojected to this watershed's grid.
-    #    Nearest-neighbour reproject of FDR is acceptable — we only need
-    #    the pointer direction, not an exact accumulation value.
+    # 4. Load per-watershed FDR — must be grid-aligned to DEM
     # ------------------------------------------------------------------
     with rasterio.open(str(fdr_path)) as fdr_src:
         if fdr_src.transform != transform or fdr_src.shape != dem.shape:
             raise RuntimeError(
                 f"Pre-clipped FDR grid does not match DEM grid. "
+                f"FDR: {fdr_src.shape} | DEM: {dem.shape}. "
                 f"Re-run clip_watersheds.py."
             )
         fdr_raw    = fdr_src.read(1).astype(np.int32)
@@ -327,31 +306,7 @@ def extract_stream_points(
     sampled_cells = _trace_channel_ordered(
         outlet_rc, upstream, sample_dist, cellsize
     )
-    from scipy.ndimage import label as nd_label
-    labeled, n_components = nd_label(valid_stream_mask)
-    logger.info(f"  Connected components in stream mask: {n_components}")
-    logger.info(f"  BFS visited {len(sampled_cells)} sample points from outlet")
 
-    # Check which components the BFS visited vs missed
-    visited_set = set(sampled_cells)
-    visited_components = set(labeled[r, c] for r, c in visited_set if labeled[r, c] > 0)
-    all_components     = set(range(1, n_components + 1))
-    missed_components  = all_components - visited_components
-    logger.info(f"  BFS visited components: {len(visited_components)}")
-    logger.info(f"  BFS missed components : {len(missed_components)}")
-
-    # For each missed component, log its size and FAC range
-    if missed_components:
-        for comp_id in sorted(missed_components)[:5]:  # show first 5
-            comp_mask  = labeled == comp_id
-            comp_size  = int(comp_mask.sum())
-            comp_rows, comp_cols = np.where(comp_mask)
-            comp_fac   = fac[comp_rows, comp_cols]
-            logger.info(
-                f"    Missed component {comp_id}: "
-                f"{comp_size} cells, "
-                f"FAC range {comp_fac.min():.0f}–{comp_fac.max():.0f}"
-            )
     if not sampled_cells:
         logger.warning("  Channel tracing produced no sample points")
         return None
@@ -431,21 +386,13 @@ def calculate_ksn_for_watershed(
 
 
 def main():
-    wbt_dir    = Path(WBT_DIR)
     dems_dir   = Path(WATERSHED_DEMS_DIR)
     output_dir = Path(OUTPUT_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     logger = setup_logging(output_dir)
 
-    fdr_path = wbt_dir / FDR_FILE
-
-    if not fdr_path.exists():
-        logger.error(f"Flow direction not found: {fdr_path}")
-        logger.error("Run wbt_hydrology.py first.")
-        sys.exit(1)
-
-    # Collect watershed DEMs, excluding the _fac.tif files
+    # Collect watershed DEMs, excluding _fac and _fdr clips
     dem_files = sorted(
         f for f in dems_dir.glob("watershed_*.tif")
         if not f.stem.endswith("_fac") and not f.stem.endswith("_fdr")
@@ -456,24 +403,22 @@ def main():
         logger.error("Run clip_watersheds.py first.")
         sys.exit(1)
 
-    # Verify matching FAC files exist before starting
-    missing_fac = [
+    # Verify matching FAC and FDR files exist before starting
+    missing = [
         f for f in dem_files
         if not (dems_dir / f"{f.stem}_fac.tif").exists()
         or not (dems_dir / f"{f.stem}_fdr.tif").exists()
     ]
-    if missing_fac:
+    if missing:
         logger.error(
-            f"{len(missing_fac)} watershed(s) missing a _fac.tif or _fdr.tif file: "
-            f"{[f.stem for f in missing_fac]}. "
-            f"Re-run clip_watersheds.py."
+            f"{len(missing)} watershed(s) missing a _fac.tif or _fdr.tif: "
+            f"{[f.stem for f in missing]}. Re-run clip_watersheds.py."
         )
         sys.exit(1)
 
     total = len(dem_files)
     logger.info(f"Found {total} watershed DEMs")
     logger.info(f"Input DEMs           : {dems_dir}")
-    logger.info(f"Flow direction       : {fdr_path}")
     logger.info(f"Output dir           : {output_dir}")
     logger.info(f"Min drainage area    : {MIN_DRAINAGE_AREA_M2 / 1e6:.3f} km²")
     logger.info(f"Reference concavity  : {REFERENCE_CONCAVITY}")
@@ -489,6 +434,7 @@ def main():
     for i, dem_path in enumerate(dem_files, start=1):
         watershed_id = dem_path.stem
         fac_path     = dems_dir / f"{watershed_id}_fac.tif"
+        fdr_path     = dems_dir / f"{watershed_id}_fdr.tif"
         out_shp      = output_dir / f"{watershed_id}_ksn.shp"
 
         if out_shp.exists():
