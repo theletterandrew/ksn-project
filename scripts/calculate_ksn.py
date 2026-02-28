@@ -46,14 +46,10 @@ import config
 # CONFIG — Edit these before running
 # =============================================================================
 
-WBT_DIR            = config.DATA_SCRATCH_WBT    # WBT outputs (full FDR)
 WATERSHED_DEMS_DIR = config.DATA_WATERSHEDS      # Watershed DEMs + per-watershed FAC rasters
 OUTPUT_DIR         = config.DATA_KSN             # Output ksn shapefiles
 
-# Full-mosaic FDR — still used for upstream tracing (reprojected to each
-# watershed grid as needed; FDR reproject is acceptable since we only need
-# the pointer direction, not an exact accumulation value).
-FDR_FILE = "flow_direction.tif"
+
 
 # Ksn calculation parameters
 MIN_DRAINAGE_AREA_M2 = config.MIN_DRAINAGE_AREA_M2
