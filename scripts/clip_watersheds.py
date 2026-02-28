@@ -234,6 +234,26 @@ def main():
                     logger.error(f"  FAC clip failed for watershed {wid}")
 
             if dem_ok and fac_ok:
+                # Mask the FAC to the DEM's valid extent.
+                # The full-mosaic FAC has valid accumulation values everywhere,
+                # so cells outside the watershed polygon but inside the bounding
+                # box carry over non-zero FAC values. Zeroing these out prevents
+                # off-channel ksn points in calculate_ksn.py.
+                with rasterio.open(str(dem_out)) as dem_src:
+                    dem_arr    = dem_src.read(1)
+                    dem_nodata = dem_src.nodata
+
+                with rasterio.open(str(fac_out)) as fac_src:
+                    fac_meta = fac_src.meta.copy()
+                    fac_arr  = fac_src.read(1)
+                    fac_nd   = fac_src.nodata
+
+                if dem_nodata is not None:
+                    fac_arr[dem_arr == dem_nodata] = fac_nd if fac_nd is not None else -9999
+
+                with rasterio.open(str(fac_out), "w", **fac_meta) as dst:
+                    dst.write(fac_arr, 1)
+
                 succeeded += 1
                 tile_time = time.time() - tile_start
                 dem_mb    = dem_out.stat().st_size / 1024 / 1024
