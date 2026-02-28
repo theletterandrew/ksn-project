@@ -266,7 +266,7 @@ def main():
     logger.info(f"Input DEMs           : {dems_dir}")
     logger.info(f"Flow accumulation    : {fac_path}")
     logger.info(f"Output dir           : {output_dir}")
-    logger.info(f"Min drainage area    : {MIN_DRAINAGE_AREA_M2/1e6:.1f} km²")
+    logger.info(f"Min drainage area    : {MIN_DRAINAGE_AREA_M2/1e6:.3f} km²")
     logger.info(f"Reference concavity  : {REFERENCE_CONCAVITY}")
     logger.info(f"Smoothing window     : {SMOOTHING_WINDOW} cells")
     logger.info(f"Sample distance      : {SAMPLE_DISTANCE} m")
