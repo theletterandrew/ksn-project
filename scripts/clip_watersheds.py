@@ -1,11 +1,19 @@
 """
 clip_watersheds.py
 ------------------
-Clips the full DEM mosaic to each watershed polygon, producing individual
-watershed DEMs suitable for ksn analysis in topotoolbox.
+Clips the full DEM mosaic and FAC raster to each watershed polygon,
+producing individual watershed DEMs and FAC rasters suitable for ksn
+analysis.
 
-For each watershed polygon, extracts the corresponding DEM extent and saves
-it as a separate GeoTIFF file named by the watershed ID.
+For each watershed polygon, extracts the corresponding DEM and FAC
+extents and saves them as separate GeoTIFF files named by the watershed
+ID, e.g.:
+    watershed_1.tif       (clipped DEM)
+    watershed_1_fac.tif   (clipped FAC, grid-aligned to DEM)
+
+Having per-watershed FAC rasters on an identical grid to their DEM
+eliminates the reprojection step in calculate_ksn.py and prevents
+spurious stream points caused by grid misalignment.
 
 USAGE:
     1. Install dependencies:
@@ -21,7 +29,7 @@ Requirements:
     - fiona
     - shapely
     - numpy
-    - Completed delineate_watersheds.py first
+    - Completed delineate_watersheds.py and wbt_hydrology.py first
 """
 
 import logging
@@ -48,12 +56,12 @@ import config
 # CONFIG — Edit these before running
 # =============================================================================
 
-DEM_MOSAIC      = config.DATA_DEM_MOSAIC / "dem_mosaic.tif"          # Full DEM mosaic
-WATERSHEDS_SHP  = config.DATA_SCRATCH_WATERSHEDS / "watersheds.shp"  # Watershed polygons
-OUTPUT_DIR      = config.DATA_WATERSHEDS                              # Output folder for clipped DEMs
+DEM_MOSAIC     = config.DATA_DEM_MOSAIC / "dem_mosaic.tif"           # Full DEM mosaic
+FAC_RASTER     = config.DATA_SCRATCH_WBT / "flow_accumulation.tif"  # Full FAC raster
+WATERSHEDS_SHP = config.DATA_SCRATCH_WATERSHEDS / "watersheds.shp"  # Watershed polygons
+OUTPUT_DIR     = config.DATA_WATERSHEDS                              # Output folder
 
 # Field in watersheds.shp that contains unique watershed IDs
-# The script will use this to name output files
 ID_FIELD = "gridcode"    # Default field created by RasterToPolygon
 
 # =============================================================================
@@ -75,33 +83,38 @@ def setup_logging(output_dir: Path) -> logging.Logger:
     return logging.getLogger(__name__)
 
 
-def clip_watershed(
-    dem_ds: rasterio.DatasetReader,
+def clip_raster(
+    ds: rasterio.DatasetReader,
     geom: dict,
-    watershed_id: int,
-    output_dir: Path,
-    logger: logging.Logger,
+    out_path: Path,
+    nodata_override=None,
+    logger: logging.Logger = None,
 ) -> tuple[bool, str]:
     """
-    Clips the DEM to a single watershed polygon geometry (GeoJSON-like dict).
+    Clips an open rasterio dataset to a single watershed polygon geometry.
+    The output grid is cropped to the geometry bounding box and masked
+    outside the polygon boundary.
+
+    nodata_override: use this nodata value in the output if the source
+    dataset has no nodata defined (e.g. some FAC rasters).
+
     Returns (success, output_path).
     """
-    out_path = output_dir / f"watershed_{watershed_id}.tif"
-
     if out_path.exists():
         return (True, str(out_path))
 
+    nodata_val = ds.nodata if ds.nodata is not None else nodata_override
+
     try:
-        # rasterio.mask.mask expects a list of geometry dicts
         clipped_data, clipped_transform = rasterio.mask.mask(
-            dem_ds,
+            ds,
             [geom],
-            crop=True,        # Crop to the bounding box of the geometry
-            filled=True,      # Fill nodata outside the mask
-            nodata=dem_ds.nodata if dem_ds.nodata is not None else np.nan,
+            crop=True,
+            filled=True,
+            nodata=nodata_val if nodata_val is not None else np.nan,
         )
 
-        out_meta = dem_ds.meta.copy()
+        out_meta = ds.meta.copy()
         out_meta.update({
             "driver":    "GTiff",
             "height":    clipped_data.shape[1],
@@ -110,6 +123,8 @@ def clip_watershed(
             "compress":  "lzw",
             "tiled":     True,
         })
+        if nodata_val is not None:
+            out_meta["nodata"] = nodata_val
 
         with rasterio.open(str(out_path), "w", **out_meta) as dst:
             dst.write(clipped_data)
@@ -117,7 +132,8 @@ def clip_watershed(
         return (True, str(out_path))
 
     except Exception as e:
-        logger.error(f"  Failed to clip watershed {watershed_id}: {e}")
+        if logger:
+            logger.error(f"  Failed to clip {out_path.name}: {e}")
         if out_path.exists():
             try:
                 out_path.unlink()
@@ -128,6 +144,7 @@ def clip_watershed(
 
 def main():
     dem_path       = Path(DEM_MOSAIC)
+    fac_path       = Path(FAC_RASTER)
     watersheds_shp = Path(WATERSHEDS_SHP)
     output_dir     = Path(OUTPUT_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -135,17 +152,17 @@ def main():
     logger = setup_logging(output_dir)
 
     # Validate inputs
-    if not dem_path.exists():
-        logger.error(f"DEM mosaic not found: {dem_path}")
-        sys.exit(1)
-    if not watersheds_shp.exists():
-        logger.error(f"Watersheds shapefile not found: {watersheds_shp}")
-        logger.error("Run delineate_watersheds.py first.")
-        sys.exit(1)
+    for label, path in [
+        ("DEM mosaic",          dem_path),
+        ("FAC raster",          fac_path),
+        ("Watersheds shapefile", watersheds_shp),
+    ]:
+        if not path.exists():
+            logger.error(f"{label} not found: {path}")
+            sys.exit(1)
 
     # Load watershed features
     with fiona.open(str(watersheds_shp)) as shp:
-        # Check that the ID field exists
         if ID_FIELD not in shp.schema["properties"]:
             available = list(shp.schema["properties"].keys())
             logger.error(
@@ -154,8 +171,7 @@ def main():
             )
             sys.exit(1)
 
-        # Read CRS for reprojection check later
-        shp_crs = shp.crs
+        shp_crs  = shp.crs
         features = [
             (feat["geometry"], feat["properties"][ID_FIELD])
             for feat in shp
@@ -163,8 +179,9 @@ def main():
 
     total = len(features)
     logger.info(f"Found {total} watersheds")
-    logger.info(f"DEM mosaic : {dem_path}")
-    logger.info(f"Output dir : {output_dir}")
+    logger.info(f"DEM mosaic  : {dem_path}")
+    logger.info(f"FAC raster  : {fac_path}")
+    logger.info(f"Output dir  : {output_dir}")
     logger.info("-" * 60)
 
     start_time = time.time()
@@ -172,46 +189,62 @@ def main():
     failed     = 0
     skipped    = 0
 
-    # Open the DEM once and reuse across all clips for efficiency
-    with rasterio.open(str(dem_path)) as dem_ds:
+    with rasterio.open(str(dem_path)) as dem_ds, \
+         rasterio.open(str(fac_path)) as fac_ds:
 
-        # Warn if CRS mismatch between shapefile and DEM
-        if shp_crs and dem_ds.crs and shp_crs != dem_ds.crs:
-            logger.warning(
-                f"CRS mismatch: shapefile={shp_crs}, DEM={dem_ds.crs}. "
-                "Geometries will be used as-is; reproject your shapefile if "
-                "results look incorrect."
-            )
+        # Warn on CRS mismatches
+        for label, ds_crs in [("DEM", dem_ds.crs), ("FAC", fac_ds.crs)]:
+            if shp_crs and ds_crs and shp_crs != ds_crs:
+                logger.warning(
+                    f"CRS mismatch: shapefile={shp_crs}, {label}={ds_crs}. "
+                    "Reproject your shapefile if results look incorrect."
+                )
 
         for i, (geom, wid) in enumerate(features, start=1):
-            out_path = output_dir / f"watershed_{wid}.tif"
+            dem_out = output_dir / f"watershed_{wid}.tif"
+            fac_out = output_dir / f"watershed_{wid}_fac.tif"
 
-            if out_path.exists():
+            dem_exists = dem_out.exists()
+            fac_exists = fac_out.exists()
+
+            if dem_exists and fac_exists:
                 skipped += 1
-                logger.info(f"[{i:3d}/{total}] SKIP  Watershed {wid} — already exists")
+                logger.info(f"[{i:3d}/{total}] SKIP  Watershed {wid} — both files exist")
                 continue
 
             logger.info(f"[{i:3d}/{total}] START Watershed {wid}...")
             tile_start = time.time()
 
-            success, result_path = clip_watershed(
-                dem_ds, geom, wid, output_dir, logger
-            )
+            # Clip DEM
+            dem_ok = True
+            if not dem_exists:
+                dem_ok, _ = clip_raster(dem_ds, geom, dem_out, logger=logger)
+                if not dem_ok:
+                    logger.error(f"  DEM clip failed for watershed {wid}")
 
-            if success:
+            # Clip FAC — use -9999 as nodata if the FAC has none defined
+            fac_ok = True
+            if not fac_exists:
+                fac_ok, _ = clip_raster(
+                    fac_ds, geom, fac_out,
+                    nodata_override=-9999,
+                    logger=logger,
+                )
+                if not fac_ok:
+                    logger.error(f"  FAC clip failed for watershed {wid}")
+
+            if dem_ok and fac_ok:
                 succeeded += 1
                 tile_time = time.time() - tile_start
-                size_mb   = Path(result_path).stat().st_size / 1024 / 1024
-
-                elapsed = time.time() - start_time
-                rate    = i / elapsed
-                eta_min = (total - i) / rate / 60 if rate > 0 else 0
-
+                dem_mb    = dem_out.stat().st_size / 1024 / 1024
+                fac_mb    = fac_out.stat().st_size / 1024 / 1024
+                elapsed   = time.time() - start_time
+                rate      = i / elapsed
+                eta_min   = (total - i) / rate / 60 if rate > 0 else 0
                 logger.info(
                     f"[{i:3d}/{total}] OK    Watershed {wid}  |  "
-                    f"{size_mb:.1f} MB  |  "
-                    f"{tile_time:.1f}s  |  "
-                    f"ETA {eta_min:.1f} min"
+                    f"DEM {dem_mb:.1f} MB  FAC {fac_mb:.1f} MB  |  "
+                    f"{tile_time:.1f}s  |  ETA {eta_min:.1f} min"
                 )
             else:
                 failed += 1
@@ -227,7 +260,7 @@ def main():
     logger.info(f"  Output dir       : {output_dir}")
     logger.info(f"  Total time       : {elapsed_total / 60:.1f} minutes")
     logger.info("")
-    logger.info("Watershed DEMs ready for ksn analysis in topotoolbox.")
+    logger.info("Watershed DEMs and FAC rasters ready for calculate_ksn.py.")
 
 
 if __name__ == "__main__":
