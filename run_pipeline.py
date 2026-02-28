@@ -41,7 +41,7 @@ SCRIPTS_TO_RUN = [
     "delineate_watersheds.py",
     "clip_watersheds.py",
     # "calculate_ksn.py",
-    # "plot_stream_profiles.py",
+    # "plot_stream_profiles.py"
 ]
 
 
