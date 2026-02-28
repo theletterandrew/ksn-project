@@ -321,36 +321,14 @@ def find_outlets_from_fac(
     logger.info(f"  {len(rows_lm):,} local FAC maxima after deduplication")
 
     # ------------------------------------------------------------------
-    # Criterion 3: cell drains to raster edge or nodata (true outlet)
+    # Outlets: the local FAC maxima are the outlets directly. This works
+    # for both clipped tiles and closed basins. The previous boundary-exit
+    # check (Criterion 3) is omitted because it incorrectly rejects all
+    # outlets when the basin drains to an interior point rather than off
+    # the raster edge.
     # ------------------------------------------------------------------
-    outlet_rows, outlet_cols = [], []
-    for r, c in zip(rows_lm, cols_lm):
-        fdr_val = int(fdr_arr[r, c])
-        if fdr_nd is not None and fdr_val == fdr_nd:
-            continue
-        offset = D8_OFFSETS.get(fdr_val)
-        if offset is None:
-            continue
-        nr, nc = r + offset[0], c + offset[1]
-        # True outlet: next cell is outside raster bounds or is nodata in FAC
-        if not (0 <= nr < nrows and 0 <= nc < ncols):
-            outlet_rows.append(r)
-            outlet_cols.append(c)
-        elif fac_nd is not None and fdr_arr[nr, nc] == fdr_nd:
-            outlet_rows.append(r)
-            outlet_cols.append(c)
-
-    logger.info(f"  {len(outlet_rows)} boundary outlet(s) identified")
-
-    # Fallback: if no boundary outlets found (closed/internal basin), use the
-    # global FAC maximum so the pipeline always produces at least one watershed.
-    if not outlet_rows:
-        logger.warning(
-            "  No boundary outlets found — basin may be internally drained. "
-            "Falling back to the global FAC maximum as a single outlet."
-        )
-        r, c = np.unravel_index(np.argmax(fac_arr), fac_arr.shape)
-        outlet_rows, outlet_cols = [r], [c]
+    outlet_rows, outlet_cols = rows_lm.tolist(), cols_lm.tolist()
+    logger.info(f"  {len(outlet_rows)} outlet(s) identified")
 
     # Convert row/col indices to map coordinates
     xs, ys = rio_xy(transform, outlet_rows, outlet_cols)
@@ -723,9 +701,6 @@ def main():
         f"Snap distance     : {SNAP_DISTANCE} cells "
         f"({SNAP_DISTANCE * cell_w:.0f} m)"
     )
-    logger.info(
-        f"Min outlet sep.   : {config.MIN_OUTLET_SEPARATION:,} m"
-    )
     logger.info("-" * 60)
 
     # ------------------------------------------------------------------
@@ -777,7 +752,7 @@ def main():
     # stream vector layer. The stream GeoPackage may only cover headwater
     # segments and never intersect the high-accumulation trunk cells, so
     # vector-based outlet detection is unreliable for full-DEM tiling.
-    min_sep_m = config.MIN_OUTLET_SEPARATION  # minimum distance between outlets (metres)
+    min_sep_m = SNAP_DISTANCE * cell_w * 3  # minimum distance between outlets
 
     primary = find_outlets_from_fac(
         fac_path, fdr_path, MIN_DRAINAGE_AREA_CELLS, min_sep_m, logger
