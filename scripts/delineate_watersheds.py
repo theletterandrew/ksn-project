@@ -348,43 +348,13 @@ def find_outlets_from_fac(
         if exits_boundary or drains_to_nodata:
             boundary_outlets.append((r, c))
 
-    # DEBUG — remove after diagnosis
-    logger.info(f"  DEBUG: rows_lm count = {len(rows_lm)}")
-    logger.info(f"  DEBUG: boundary_outlets count = {len(boundary_outlets)}")
-    if boundary_outlets:
-        for r, c in boundary_outlets[:5]:  # show first 5
-            fdr_val = int(fdr_arr[r, c])
-            fac_val = float(fac_arr[r, c])
-            offset  = D8_OFFSETS.get(fdr_val)
-            nr, nc  = (r + offset[0], c + offset[1]) if offset else (None, None)
-            logger.info(
-                f"    outlet r={r} c={c}  FAC={fac_val:,.0f}  FDR={fdr_val}  "
-                f"next=({nr},{nc})  nrows={nrows} ncols={ncols}"
-            )
-    # DEBUG — extended
-    logger.info(f"  DEBUG: nrows={nrows}, ncols={ncols}")
-    for r, c in zip(rows_lm, cols_lm):
-        fdr_val = int(fdr_arr[r, c])
-        fac_val = float(fac_arr[r, c])
-        offset  = D8_OFFSETS.get(fdr_val)
-        if offset:
-            nr, nc = r + offset[0], c + offset[1]
-            exits  = not (0 <= nr < nrows and 0 <= nc < ncols)
-            next_fdr = int(fdr_arr[nr, nc]) if (0 <= nr < nrows and 0 <= nc < ncols) else "OOB"
-        else:
-            nr, nc, exits, next_fdr = None, None, False, "no_offset"
-        logger.info(
-            f"    r={r} c={c}  FAC={fac_val:,.0f}  FDR={fdr_val}  "
-            f"next=({nr},{nc})  exits_boundary={exits}  next_fdr={next_fdr}"
-        )
-
     if boundary_outlets:
         outlet_rows = [r for r, c in boundary_outlets]
         outlet_cols = [c for r, c in boundary_outlets]
         logger.info(f"  {len(outlet_rows)} boundary outlet(s) identified")
     else:
         # Closed basin fallback — keep local maxima
-        logger.warning("  No boundary outlets found — using local FAC maxima (closed basin)")
+        logger.info("  No boundary outlets found — using local FAC maxima (closed basin)")
         outlet_rows, outlet_cols = rows_lm.tolist(), cols_lm.tolist()
 
     # ------------------------------------------------------------------
