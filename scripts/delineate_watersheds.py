@@ -320,15 +320,41 @@ def find_outlets_from_fac(
     rows_lm, cols_lm = np.where(local_max_mask)
     logger.info(f"  {len(rows_lm):,} local FAC maxima after deduplication")
 
+    # Criterion 3 (restored): cell's D8 pointer exits the raster
+    # OR drains into a nodata cell — these are the true basin outlets
+    boundary_outlets = []
+    for r, c in zip(rows_lm, cols_lm):
+        fdr_val = int(fdr_arr[r, c])
+        if fdr_nodata is not None and fdr_val == int(fdr_nodata):
+            continue
+        offset = D8_OFFSETS.get(fdr_val)
+        if offset is None:
+            continue
+        nr, nc = r + offset[0], c + offset[1]
+        # Exits raster boundary
+        exits_boundary = not (0 <= nr < nrows and 0 <= nc < ncols)
+        # Drains into nodata
+        drains_to_nodata = (
+            (0 <= nr < nrows and 0 <= nc < ncols)
+            and fdr_nd is not None
+            and int(fdr_arr[nr, nc]) == int(fdr_nd)
+        )
+        if exits_boundary or drains_to_nodata:
+            boundary_outlets.append((r, c))
+
+    if boundary_outlets:
+        outlet_rows = [r for r, c in boundary_outlets]
+        outlet_cols = [c for r, c in boundary_outlets]
+        logger.info(f"  {len(outlet_rows)} boundary outlet(s) identified")
+    else:
+        # Closed basin fallback — keep local maxima
+        logger.warning("  No boundary outlets found — using local FAC maxima (closed basin)")
+        outlet_rows, outlet_cols = rows_lm.tolist(), cols_lm.tolist()
+
     # ------------------------------------------------------------------
     # Outlets: the local FAC maxima are the outlets directly. This works
-    # for both clipped tiles and closed basins. The previous boundary-exit
-    # check (Criterion 3) is omitted because it incorrectly rejects all
-    # outlets when the basin drains to an interior point rather than off
-    # the raster edge.
+    # for both clipped tiles and closed basins.
     # ------------------------------------------------------------------
-    outlet_rows, outlet_cols = rows_lm.tolist(), cols_lm.tolist()
-    logger.info(f"  {len(outlet_rows)} outlet(s) identified")
 
     # Convert row/col indices to map coordinates
     xs, ys = rio_xy(transform, outlet_rows, outlet_cols)
