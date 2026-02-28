@@ -84,7 +84,7 @@ MIN_DRAINAGE_AREA_CELLS = 900000 if TEST_RUN else 10000000    # cells (~4 km² a
 BORDER_CELLS = 3
 
 # Minimum distance separating the outlet points (in meters)
-MIN_OUTLET_SEPARATION = 1000
+MIN_OUTLET_SEPARATION = 2000
 
 # --- DELETE EMPTY FILES PARAMETERS ---
 MIN_TILE_SIZE_KB = 1
