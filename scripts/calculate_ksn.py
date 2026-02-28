@@ -452,7 +452,7 @@ def main():
     # Collect watershed DEMs, excluding the _fac.tif files
     dem_files = sorted(
         f for f in dems_dir.glob("watershed_*.tif")
-        if not f.stem.endswith("_fac")
+        if not f.stem.endswith("_fac") and not f.stem.endswith("_fdr")
     )
 
     if not dem_files:
@@ -464,10 +464,11 @@ def main():
     missing_fac = [
         f for f in dem_files
         if not (dems_dir / f"{f.stem}_fac.tif").exists()
+        or not (dems_dir / f"{f.stem}_fdr.tif").exists()
     ]
     if missing_fac:
         logger.error(
-            f"{len(missing_fac)} watershed(s) missing a _fac.tif file: "
+            f"{len(missing_fac)} watershed(s) missing a _fac.tif or _fdr.tif file: "
             f"{[f.stem for f in missing_fac]}. "
             f"Re-run clip_watersheds.py."
         )
