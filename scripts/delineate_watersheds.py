@@ -342,6 +342,20 @@ def find_outlets_from_fac(
         if exits_boundary or drains_to_nodata:
             boundary_outlets.append((r, c))
 
+    # DEBUG — remove after diagnosis
+    logger.info(f"  DEBUG: rows_lm count = {len(rows_lm)}")
+    logger.info(f"  DEBUG: boundary_outlets count = {len(boundary_outlets)}")
+    if boundary_outlets:
+        for r, c in boundary_outlets[:5]:  # show first 5
+            fdr_val = int(fdr_arr[r, c])
+            fac_val = float(fac_arr[r, c])
+            offset  = D8_OFFSETS.get(fdr_val)
+            nr, nc  = (r + offset[0], c + offset[1]) if offset else (None, None)
+            logger.info(
+                f"    outlet r={r} c={c}  FAC={fac_val:,.0f}  FDR={fdr_val}  "
+                f"next=({nr},{nc})  nrows={nrows} ncols={ncols}"
+            )
+
     if boundary_outlets:
         outlet_rows = [r for r, c in boundary_outlets]
         outlet_cols = [c for r, c in boundary_outlets]
