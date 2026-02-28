@@ -83,7 +83,7 @@ MIN_PIXELS = 10
 # Edge cells drain "off the raster" in D8 routing and accumulate spurious
 # flow, creating false streams along the DEM boundary.
 # At 2 m resolution, 3 cells = 6 m. Increase to 5-10 if artifacts persist.
-BORDER_CELLS = 3
+BORDER_CELLS = config.BORDER_CELLS
 
 # =============================================================================
 # END CONFIG — No edits needed below this line
