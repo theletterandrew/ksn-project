@@ -58,6 +58,8 @@ import config
 
 DEM_MOSAIC     = config.DATA_DEM_MOSAIC / "dem_mosaic.tif"           # Full DEM mosaic
 FAC_RASTER     = config.DATA_SCRATCH_WBT / "flow_accumulation.tif"  # Full FAC raster
+FDR_RASTER = config.DATA_SCRATCH_WBT / "flow_direction.tif"
+
 WATERSHEDS_SHP = config.DATA_SCRATCH_WATERSHEDS / "watersheds.shp"  # Watershed polygons
 OUTPUT_DIR     = config.DATA_WATERSHEDS                              # Output folder
 
@@ -190,7 +192,8 @@ def main():
     skipped    = 0
 
     with rasterio.open(str(dem_path)) as dem_ds, \
-         rasterio.open(str(fac_path)) as fac_ds:
+        rasterio.open(str(fac_path)) as fac_ds, \
+        rasterio.open(str(fdr_path)) as fdr_ds:
 
         # Warn on CRS mismatches
         for label, ds_crs in [("DEM", dem_ds.crs), ("FAC", fac_ds.crs)]:
@@ -203,11 +206,13 @@ def main():
         for i, (geom, wid) in enumerate(features, start=1):
             dem_out = output_dir / f"watershed_{wid}.tif"
             fac_out = output_dir / f"watershed_{wid}_fac.tif"
+            fdr_out = output_dir / f"watershed_{wid}_fdr.tif"
 
             dem_exists = dem_out.exists()
             fac_exists = fac_out.exists()
+            fdr_exists = fdr_out.exists()
 
-            if dem_exists and fac_exists:
+            if dem_exists and fac_exists and fdr_exists:
                 skipped += 1
                 logger.info(f"[{i:3d}/{total}] SKIP  Watershed {wid} — both files exist")
                 continue
@@ -233,7 +238,18 @@ def main():
                 if not fac_ok:
                     logger.error(f"  FAC clip failed for watershed {wid}")
 
-            if dem_ok and fac_ok:
+            # Clip FDR
+            fdr_ok = True
+            if not fdr_out.exists():
+                fdr_ok, _ = clip_raster(
+                    fdr_ds, geom, fdr_out,
+                    nodata_override=0,
+                    logger = logger,
+                )
+                if not fdr_ok:
+                    logger.error(f"  FDR clip failed for watershed {wid}")
+
+            if dem_ok and fac_ok and fdr_ok:
                 # Mask the FAC to the DEM's valid extent.
                 # The full-mosaic FAC has valid accumulation values everywhere,
                 # so cells outside the watershed polygon but inside the bounding
