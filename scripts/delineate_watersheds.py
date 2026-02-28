@@ -325,7 +325,7 @@ def find_outlets_from_fac(
     boundary_outlets = []
     for r, c in zip(rows_lm, cols_lm):
         fdr_val = int(fdr_arr[r, c])
-        if fdr_nodata is not None and fdr_val == int(fdr_nodata):
+        if fdr_nd is not None and fdr_val == int(fdr_nd):
             continue
         offset = D8_OFFSETS.get(fdr_val)
         if offset is None:
