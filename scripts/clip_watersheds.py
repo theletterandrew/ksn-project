@@ -13,9 +13,13 @@ All three rasters share an identical grid, eliminating any reprojection
 in calculate_ksn.py and preventing spurious stream points from grid
 misalignment.
 
-The full-mosaic FAC border cells are blanked before clipping (using
-config.BORDER_CELLS) to suppress spurious edge accumulation that WBT
-D8 routing produces along the raster boundary.
+Both the FAC and FDR border cells are blanked before clipping (using
+config.BORDER_CELLS) to suppress:
+  - Spurious high-accumulation values that WBT D8 routing produces along
+    the FAC raster boundary (causes false stream lines at the DEM edge)
+  - FDR=0 unresolved cells along the FDR raster boundary (causes D8
+    connectivity to shatter into thousands of disconnected components,
+    breaking the upstream tracing in calculate_ksn.py)
 
 USAGE:
     1. Install dependencies:
@@ -84,6 +88,49 @@ def setup_logging(output_dir: Path) -> logging.Logger:
     return logging.getLogger(__name__)
 
 
+def make_border_blanked(
+    src_path: Path,
+    border_cells: int,
+    nodata_override,
+    label: str,
+    logger: logging.Logger,
+) -> Path:
+    """
+    Read a full-mosaic raster, blank `border_cells` rows/cols on all four
+    edges, and write the result to a temporary GeoTIFF.
+
+    nodata_override is used as the fill value if the source has no nodata
+    defined (e.g. FDR uses 0, FAC uses -9999).
+
+    Returns the path to the temporary file. The caller is responsible for
+    deleting it when done (use a try/finally block).
+    """
+    with rasterio.open(str(src_path)) as src:
+        meta    = src.meta.copy()
+        arr     = src.read(1)
+        nd      = src.nodata
+
+    fill_val = nd if nd is not None else nodata_override
+    meta.update(nodata=fill_val)
+
+    if border_cells > 0:
+        b = border_cells
+        arr[:b,  :] = fill_val
+        arr[-b:, :] = fill_val
+        arr[:,  :b] = fill_val
+        arr[:, -b:] = fill_val
+        logger.info(
+            f"Blanked {b}-cell border in {label} mosaic "
+            f"(fill={fill_val})"
+        )
+
+    tmp = Path(tempfile.mktemp(suffix=f"_{label}_bordered.tif"))
+    with rasterio.open(str(tmp), "w", **meta) as dst:
+        dst.write(arr, 1)
+
+    return tmp
+
+
 def clip_raster(
     ds: rasterio.DatasetReader,
     geom: dict,
@@ -140,42 +187,6 @@ def clip_raster(
         return (False, "")
 
 
-def make_border_blanked_fac(fac_path: Path, border_cells: int,
-                             logger: logging.Logger) -> Path:
-    """
-    Read the full-mosaic FAC, blank `border_cells` rows/cols on all four
-    edges to suppress spurious WBT edge accumulation, and write the result
-    to a temporary GeoTIFF.
-
-    Returns the path to the temporary file. The caller is responsible for
-    deleting it when done.
-    """
-    with rasterio.open(str(fac_path)) as src:
-        meta    = src.meta.copy()
-        fac_arr = src.read(1)
-        fac_nd  = src.nodata
-
-    fill_val = fac_nd if fac_nd is not None else -9999
-    meta.update(nodata=fill_val)
-
-    if border_cells > 0:
-        b = border_cells
-        fac_arr[:b,  :] = fill_val
-        fac_arr[-b:, :] = fill_val
-        fac_arr[:,  :b] = fill_val
-        fac_arr[:, -b:] = fill_val
-        logger.info(
-            f"Blanked {b}-cell border in full-mosaic FAC "
-            f"to suppress edge accumulation artifacts"
-        )
-
-    tmp = Path(tempfile.mktemp(suffix="_fac_bordered.tif"))
-    with rasterio.open(str(tmp), "w", **meta) as dst:
-        dst.write(fac_arr, 1)
-
-    return tmp
-
-
 def main():
     dem_path       = Path(DEM_MOSAIC)
     fac_path       = Path(FAC_RASTER)
@@ -223,13 +234,25 @@ def main():
     logger.info("-" * 60)
 
     # ------------------------------------------------------------------
-    # Pre-process: blank FAC mosaic border cells once before any clipping.
-    # This suppresses the spurious high-accumulation line that WBT D8
-    # routing produces along the raster boundary, which otherwise bleeds
-    # into clipped watershed FACs and creates false stream points at the
-    # DEM edge in calculate_ksn.py.
+    # Pre-process: blank border cells in both FAC and FDR mosaics before
+    # clipping. Written to temp files so the originals are never modified.
+    #
+    # FAC: WBT D8 routing accumulates spurious flow along raster edges,
+    #      producing a false high-accumulation line at the mosaic boundary.
+    #
+    # FDR: Edge cells get FDR=0 (unresolved) because WBT cannot route
+    #      flow off the raster. These 0-value cells break D8 upstream
+    #      tracing in calculate_ksn.py, shattering the stream network into
+    #      thousands of disconnected single-cell components.
     # ------------------------------------------------------------------
-    tmp_fac = make_border_blanked_fac(fac_path, config.BORDER_CELLS, logger)
+    tmp_fac = make_border_blanked(
+        fac_path, config.BORDER_CELLS,
+        nodata_override=-9999, label="FAC", logger=logger,
+    )
+    tmp_fdr = make_border_blanked(
+        fdr_path, config.BORDER_CELLS,
+        nodata_override=0, label="FDR", logger=logger,
+    )
 
     start_time = time.time()
     succeeded  = 0
@@ -239,7 +262,7 @@ def main():
     try:
         with rasterio.open(str(dem_path)) as dem_ds, \
              rasterio.open(str(tmp_fac))  as fac_ds, \
-             rasterio.open(str(fdr_path)) as fdr_ds:
+             rasterio.open(str(tmp_fdr))  as fdr_ds:
 
             # Warn on CRS mismatches
             for label, ds_crs in [
@@ -275,7 +298,7 @@ def main():
                     if not dem_ok:
                         logger.error(f"  DEM clip failed for watershed {wid}")
 
-                # Clip FAC (border-blanked version)
+                # Clip FAC (border-blanked)
                 fac_ok = True
                 if not fac_out.exists():
                     fac_ok, _ = clip_raster(
@@ -286,7 +309,7 @@ def main():
                     if not fac_ok:
                         logger.error(f"  FAC clip failed for watershed {wid}")
 
-                # Clip FDR
+                # Clip FDR (border-blanked)
                 fdr_ok = True
                 if not fdr_out.exists():
                     fdr_ok, _ = clip_raster(
@@ -340,8 +363,9 @@ def main():
                     logger.error(f"[{i:3d}/{total}] FAIL  Watershed {wid}")
 
     finally:
-        # Always clean up the temporary border-blanked FAC
+        # Always clean up temp files even if something crashes mid-run
         tmp_fac.unlink(missing_ok=True)
+        tmp_fdr.unlink(missing_ok=True)
 
     elapsed_total = time.time() - start_time
     logger.info("=" * 60)
