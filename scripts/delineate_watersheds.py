@@ -325,15 +325,21 @@ def find_outlets_from_fac(
     boundary_outlets = []
     for r, c in zip(rows_lm, cols_lm):
         fdr_val = int(fdr_arr[r, c])
+
+        # FDR=0 on a raster-edge cell means WBT couldn't route flow further —
+        # this IS a boundary outlet. Check edge membership directly.
+        on_edge = (r == 0 or r == nrows - 1 or c == 0 or c == ncols - 1)
+        if fdr_val == 0 and on_edge:
+            boundary_outlets.append((r, c))
+            continue
+
         if fdr_nd is not None and fdr_val == int(fdr_nd):
             continue
         offset = D8_OFFSETS.get(fdr_val)
         if offset is None:
             continue
         nr, nc = r + offset[0], c + offset[1]
-        # Exits raster boundary
         exits_boundary = not (0 <= nr < nrows and 0 <= nc < ncols)
-        # Drains into nodata
         drains_to_nodata = (
             (0 <= nr < nrows and 0 <= nc < ncols)
             and fdr_nd is not None
