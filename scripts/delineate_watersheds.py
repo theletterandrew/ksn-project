@@ -73,11 +73,6 @@ MIN_DRAINAGE_AREA_CELLS = config.MIN_WATERSHED_AREA  # ~40 km² at 2m resolution
 # internally. 50 cells * 2m = 100m snap radius.
 SNAP_DISTANCE = config.SNAP_DISTANCE  # cells (e.g. 50 cells = 100 m at 2 m resolution)
 
-# Number of border cells to exclude when searching for outlet candidates.
-# Must match the value used in stream_extraction_wbt.py so that no pour point
-# is placed in the edge strip where D8 flow values are unreliable.
-BORDER_CELLS = config.BORDER_CELLS
-
 # Set to True to log FDR diagnostics around the snapped pour point.
 # Useful when WBT Watershed returns an empty result; disable for production runs.
 DEBUG_POUR_POINTS = False
@@ -305,34 +300,6 @@ def find_outlets_from_fac(
         return gpd.GeoDataFrame(geometry=[], crs=crs)
 
     logger.info(f"  {len(rows_above):,} FAC cells >= {min_accum_cells:,} cells")
-
-    # ------------------------------------------------------------------
-    # Border guard: discard any candidate within BORDER_CELLS of the
-    # raster edge. These cells accumulate spurious flow in D8 routing
-    # and produce false outlet detections. Must match the value used in
-    # stream_extraction_wbt.py.
-    # ------------------------------------------------------------------
-    if BORDER_CELLS > 0:
-        b = BORDER_CELLS
-        interior = (
-            (rows_above >= b) & (rows_above < nrows - b) &
-            (cols_above >= b) & (cols_above < ncols - b)
-        )
-        n_before = len(rows_above)
-        rows_above = rows_above[interior]
-        cols_above = cols_above[interior]
-        n_removed = n_before - len(rows_above)
-        if n_removed:
-            logger.info(
-                f"  Excluded {n_removed:,} edge candidates "
-                f"(within {b}-cell border)"
-            )
-        if len(rows_above) == 0:
-            logger.error(
-                "No FAC candidates remain after border exclusion. "
-                "Lower BORDER_CELLS or MIN_WATERSHED_AREA in config.py."
-            )
-            return gpd.GeoDataFrame(geometry=[], crs=crs)
 
     # ------------------------------------------------------------------
     # Criterion 2: local FAC maxima within min_sep_m radius (fast numpy)
@@ -756,6 +723,9 @@ def main():
         f"Snap distance     : {SNAP_DISTANCE} cells "
         f"({SNAP_DISTANCE * cell_w:.0f} m)"
     )
+    logger.info(
+        f"Min outlet sep.   : {config.MIN_OUTLET_SEPARATION:,} m"
+    )
     logger.info("-" * 60)
 
     # ------------------------------------------------------------------
@@ -807,7 +777,7 @@ def main():
     # stream vector layer. The stream GeoPackage may only cover headwater
     # segments and never intersect the high-accumulation trunk cells, so
     # vector-based outlet detection is unreliable for full-DEM tiling.
-    min_sep_m = SNAP_DISTANCE * cell_w * 3  # minimum distance between outlets
+    min_sep_m = config.MIN_OUTLET_SEPARATION  # minimum distance between outlets (metres)
 
     primary = find_outlets_from_fac(
         fac_path, fdr_path, MIN_DRAINAGE_AREA_CELLS, min_sep_m, logger
