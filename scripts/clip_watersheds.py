@@ -147,6 +147,7 @@ def clip_raster(
 def main():
     dem_path       = Path(DEM_MOSAIC)
     fac_path       = Path(FAC_RASTER)
+    fdr_path       = Path(FDR_RASTER)
     watersheds_shp = Path(WATERSHEDS_SHP)
     output_dir     = Path(OUTPUT_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -157,6 +158,7 @@ def main():
     for label, path in [
         ("DEM mosaic",          dem_path),
         ("FAC raster",          fac_path),
+        ("FDR raster",          fdr_path),
         ("Watersheds shapefile", watersheds_shp),
     ]:
         if not path.exists():
