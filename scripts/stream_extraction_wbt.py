@@ -79,6 +79,12 @@ THRESHOLD = config.STREAM_THRESHOLD
 # Removes single-pixel stubs and short noise branches.
 MIN_PIXELS = 10
 
+# Number of border cells to blank on all four edges before thresholding.
+# Edge cells drain "off the raster" in D8 routing and accumulate spurious
+# flow, creating false streams along the DEM boundary.
+# At 2 m resolution, 3 cells = 6 m. Increase to 5-10 if artifacts persist.
+BORDER_CELLS = 3
+
 # =============================================================================
 # END CONFIG — No edits needed below this line
 # =============================================================================
@@ -264,6 +270,26 @@ def order_segment_by_fdr(
     return chain
 
 
+def drains_off_edge(chain: list, fdr_arr: np.ndarray, fdr_nodata) -> bool:
+    """
+    Return True if the downstream end of the chain (chain[0]) has a D8
+    pointer that exits the raster boundary.
+
+    Used as a secondary filter to remove segments whose only reason to
+    exist is draining off a raster edge rather than to a real outlet.
+    """
+    nrows, ncols = fdr_arr.shape
+    r, c = chain[0]
+    fdr_val = int(fdr_arr[r, c])
+    if fdr_nodata is not None and fdr_val == int(fdr_nodata):
+        return False
+    offset = D8_OFFSETS.get(fdr_val)
+    if offset is None:
+        return False
+    nr, nc = r + offset[0], c + offset[1]
+    return not (0 <= nr < nrows and 0 <= nc < ncols)
+
+
 def pixels_to_linestring(chain: list, transform) -> LineString:
     """Convert a pixel chain [(r,c),...] to a map-coordinate LineString."""
     coords = [
@@ -291,8 +317,9 @@ def main():
             logger.error("Run wbt_hydrology.py first.")
             sys.exit(1)
 
-    logger.info(f"Threshold : {THRESHOLD:,} cells (~{THRESHOLD * 4 / 1e6:.1f} km² at 2m)")
-    logger.info(f"Min pixels: {MIN_PIXELS}")
+    logger.info(f"Threshold   : {THRESHOLD:,} cells (~{THRESHOLD * 4 / 1e6:.1f} km² at 2m)")
+    logger.info(f"Min pixels  : {MIN_PIXELS}")
+    logger.info(f"Border cells: {BORDER_CELLS}")
     logger.info("-" * 60)
 
     start_time = time.time()
@@ -310,13 +337,18 @@ def main():
 
         valid_mask  = (fac_data != nodata) if nodata is not None else np.ones_like(fac_data, dtype=bool)
         stream_mask = (fac_data >= THRESHOLD) & valid_mask
-        if config.BORDER_CELLS > 0:
-            b = config.BORDER_CELLS
+
+        # FIX 1: Blank the raster border before thresholding.
+        # Edge cells drain "off the raster" in D8 routing and accumulate
+        # spurious flow, producing false streams along the DEM boundary.
+        if BORDER_CELLS > 0:
+            b = BORDER_CELLS
             stream_mask[:b,  :] = False   # top
             stream_mask[-b:, :] = False   # bottom
             stream_mask[:,  :b] = False   # left
             stream_mask[:, -b:] = False   # right
             logger.info(f"  Blanked {b}-cell border to suppress edge artifacts")
+
         pixel_count = int(stream_mask.sum())
         logger.info(f"  Stream pixels above threshold: {pixel_count:,}")
         del fac_data, valid_mask
@@ -364,6 +396,25 @@ def main():
         # ------------------------------------------------------------------
         logger.info("Step 5: Orienting segments mouth->source using FDR...")
         segments = [order_segment_by_fdr(s, fdr_arr, fdr_nodata) for s in segments]
+
+        # FIX 2: Remove segments whose downstream end drains off the raster
+        # edge. These are boundary artifacts — real watershed outlets that
+        # legitimately exit the DEM will have been removed by BORDER_CELLS
+        # already; anything surviving here is likely a false stream.
+        before = len(segments)
+        segments = [s for s in segments if not drains_off_edge(s, fdr_arr, fdr_nodata)]
+        removed = before - len(segments)
+        if removed:
+            logger.info(f"  Removed {removed:,} edge-draining segments (boundary artifacts)")
+        logger.info(f"  Segments after edge-drain filter: {len(segments):,}")
+
+        if not segments:
+            logger.error(
+                "No segments survived the edge-drain filter. "
+                "Your study area may legitimately drain off all edges — "
+                "set BORDER_CELLS = 0 and re-run if this is expected."
+            )
+            sys.exit(1)
 
         # ------------------------------------------------------------------
         # Step 6: Convert to LineStrings and write GeoPackage
