@@ -30,12 +30,12 @@ def sanitize_env():
 SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
 
 SCRIPTS_TO_RUN = [
-    "batchdownload.py",
-    "laz_to_las.py",
-    "las_diagnostics.py",
-    "delete_empty_files.py",
-    "las_to_dem.py",
-    "mosaic_dem.py",
+    # "batchdownload.py",
+    # "laz_to_las.py",
+    # "las_diagnostics.py",
+    # "delete_empty_files.py",
+    # "las_to_dem.py",
+    # "mosaic_dem.py",
     "wbt_hydrology.py",
     "stream_extraction_wbt.py",
     "delineate_watersheds.py",
