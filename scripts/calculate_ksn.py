@@ -254,6 +254,21 @@ def extract_stream_points(
     if not stream_mask.any():
         logger.warning("  No stream cells above threshold")
         return None
+    
+    # DIAGNOSTIC — remove after diagnosis
+    logger.info(f"  dem shape: {dem.shape}, nodata: {nodata}")
+    logger.info(f"  dem nodata cells: {(dem == nodata).sum() if nodata is not None else 0:,}")
+    logger.info(f"  dem_valid cells: {dem_valid.sum():,}")
+    logger.info(f"  fac > 0 cells: {(fac > 0).sum():,}")
+    logger.info(f"  area_m2 >= threshold cells: {(area_m2 >= min_area_m2).sum():,}")
+    logger.info(f"  stream_mask cells (after dem_valid): {stream_mask.sum():,}")
+    # Sample some off-network stream_mask cells
+    off_network = stream_mask & ~dem_valid
+    logger.info(f"  stream_mask cells outside dem_valid: {off_network.sum():,}")
+    # Check FAC values at nodata DEM locations
+    if nodata is not None:
+        fac_at_nodata = fac[dem == nodata]
+        logger.info(f"  FAC at DEM nodata cells — min: {fac_at_nodata.min():.0f}  max: {fac_at_nodata.max():.0f}  nonzero: {(fac_at_nodata != 0).sum():,}")
 
     # ------------------------------------------------------------------
     # 4. Load full-mosaic FDR, reprojected to this watershed's grid.
