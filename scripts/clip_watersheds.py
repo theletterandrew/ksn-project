@@ -1,19 +1,21 @@
 """
 clip_watersheds.py
 ------------------
-Clips the full DEM mosaic and FAC raster to each watershed polygon,
-producing individual watershed DEMs and FAC rasters suitable for ksn
-analysis.
+Clips the full DEM mosaic, FAC, and FDR rasters to each watershed polygon,
+producing individual per-watershed rasters suitable for ksn analysis.
 
-For each watershed polygon, extracts the corresponding DEM and FAC
-extents and saves them as separate GeoTIFF files named by the watershed
-ID, e.g.:
+For each watershed polygon, produces:
     watershed_1.tif       (clipped DEM)
     watershed_1_fac.tif   (clipped FAC, grid-aligned to DEM)
+    watershed_1_fdr.tif   (clipped FDR, grid-aligned to DEM)
 
-Having per-watershed FAC rasters on an identical grid to their DEM
-eliminates the reprojection step in calculate_ksn.py and prevents
-spurious stream points caused by grid misalignment.
+All three rasters share an identical grid, eliminating any reprojection
+in calculate_ksn.py and preventing spurious stream points from grid
+misalignment.
+
+The full-mosaic FAC border cells are blanked before clipping (using
+config.BORDER_CELLS) to suppress spurious edge accumulation that WBT
+D8 routing produces along the raster boundary.
 
 USAGE:
     1. Install dependencies:
@@ -34,6 +36,7 @@ Requirements:
 
 import logging
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -41,12 +44,9 @@ import fiona
 import numpy as np
 import rasterio
 import rasterio.mask
-from shapely.geometry import shape
 
 # Calculate the path to the project root (one level up from scripts/)
 root_dir = Path(__file__).resolve().parent.parent
-
-# Add the root directory to sys.path so Python can find config.py
 if str(root_dir) not in sys.path:
     sys.path.append(str(root_dir))
 
@@ -56,15 +56,14 @@ import config
 # CONFIG — Edit these before running
 # =============================================================================
 
-DEM_MOSAIC     = config.DATA_DEM_MOSAIC / "dem_mosaic.tif"           # Full DEM mosaic
-FAC_RASTER     = config.DATA_SCRATCH_WBT / "flow_accumulation.tif"  # Full FAC raster
-FDR_RASTER = config.DATA_SCRATCH_WBT / "flow_direction.tif"
-
-WATERSHEDS_SHP = config.DATA_SCRATCH_WATERSHEDS / "watersheds.shp"  # Watershed polygons
-OUTPUT_DIR     = config.DATA_WATERSHEDS                              # Output folder
+DEM_MOSAIC     = config.DATA_DEM_MOSAIC / "dem_mosaic.tif"
+FAC_RASTER     = config.DATA_SCRATCH_WBT / "flow_accumulation.tif"
+FDR_RASTER     = config.DATA_SCRATCH_WBT / "flow_direction.tif"
+WATERSHEDS_SHP = config.DATA_SCRATCH_WATERSHEDS / "watersheds.shp"
+OUTPUT_DIR     = config.DATA_WATERSHEDS
 
 # Field in watersheds.shp that contains unique watershed IDs
-ID_FIELD = "gridcode"    # Default field created by RasterToPolygon
+ID_FIELD = "gridcode"
 
 # =============================================================================
 # END CONFIG — No edits needed below this line
@@ -79,8 +78,8 @@ def setup_logging(output_dir: Path) -> logging.Logger:
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[
             logging.FileHandler(log_path),
-            logging.StreamHandler(sys.stdout)
-        ]
+            logging.StreamHandler(sys.stdout),
+        ],
     )
     return logging.getLogger(__name__)
 
@@ -94,12 +93,9 @@ def clip_raster(
 ) -> tuple[bool, str]:
     """
     Clips an open rasterio dataset to a single watershed polygon geometry.
-    The output grid is cropped to the geometry bounding box and masked
-    outside the polygon boundary.
+    Crops to the bounding box and masks cells outside the polygon.
 
-    nodata_override: use this nodata value in the output if the source
-    dataset has no nodata defined (e.g. some FAC rasters).
-
+    nodata_override: use this nodata value if the source has none defined.
     Returns (success, output_path).
     """
     if out_path.exists():
@@ -144,6 +140,42 @@ def clip_raster(
         return (False, "")
 
 
+def make_border_blanked_fac(fac_path: Path, border_cells: int,
+                             logger: logging.Logger) -> Path:
+    """
+    Read the full-mosaic FAC, blank `border_cells` rows/cols on all four
+    edges to suppress spurious WBT edge accumulation, and write the result
+    to a temporary GeoTIFF.
+
+    Returns the path to the temporary file. The caller is responsible for
+    deleting it when done.
+    """
+    with rasterio.open(str(fac_path)) as src:
+        meta    = src.meta.copy()
+        fac_arr = src.read(1)
+        fac_nd  = src.nodata
+
+    fill_val = fac_nd if fac_nd is not None else -9999
+    meta.update(nodata=fill_val)
+
+    if border_cells > 0:
+        b = border_cells
+        fac_arr[:b,  :] = fill_val
+        fac_arr[-b:, :] = fill_val
+        fac_arr[:,  :b] = fill_val
+        fac_arr[:, -b:] = fill_val
+        logger.info(
+            f"Blanked {b}-cell border in full-mosaic FAC "
+            f"to suppress edge accumulation artifacts"
+        )
+
+    tmp = Path(tempfile.mktemp(suffix="_fac_bordered.tif"))
+    with rasterio.open(str(tmp), "w", **meta) as dst:
+        dst.write(fac_arr, 1)
+
+    return tmp
+
+
 def main():
     dem_path       = Path(DEM_MOSAIC)
     fac_path       = Path(FAC_RASTER)
@@ -156,9 +188,9 @@ def main():
 
     # Validate inputs
     for label, path in [
-        ("DEM mosaic",          dem_path),
-        ("FAC raster",          fac_path),
-        ("FDR raster",          fdr_path),
+        ("DEM mosaic",           dem_path),
+        ("FAC raster",           fac_path),
+        ("FDR raster",           fdr_path),
         ("Watersheds shapefile", watersheds_shp),
     ]:
         if not path.exists():
@@ -183,110 +215,133 @@ def main():
 
     total = len(features)
     logger.info(f"Found {total} watersheds")
-    logger.info(f"DEM mosaic  : {dem_path}")
-    logger.info(f"FAC raster  : {fac_path}")
-    logger.info(f"Output dir  : {output_dir}")
+    logger.info(f"DEM mosaic   : {dem_path}")
+    logger.info(f"FAC raster   : {fac_path}")
+    logger.info(f"FDR raster   : {fdr_path}")
+    logger.info(f"Output dir   : {output_dir}")
+    logger.info(f"Border cells : {config.BORDER_CELLS}")
     logger.info("-" * 60)
+
+    # ------------------------------------------------------------------
+    # Pre-process: blank FAC mosaic border cells once before any clipping.
+    # This suppresses the spurious high-accumulation line that WBT D8
+    # routing produces along the raster boundary, which otherwise bleeds
+    # into clipped watershed FACs and creates false stream points at the
+    # DEM edge in calculate_ksn.py.
+    # ------------------------------------------------------------------
+    tmp_fac = make_border_blanked_fac(fac_path, config.BORDER_CELLS, logger)
 
     start_time = time.time()
     succeeded  = 0
     failed     = 0
     skipped    = 0
 
-    with rasterio.open(str(dem_path)) as dem_ds, \
-        rasterio.open(str(fac_path)) as fac_ds, \
-        rasterio.open(str(fdr_path)) as fdr_ds:
+    try:
+        with rasterio.open(str(dem_path)) as dem_ds, \
+             rasterio.open(str(tmp_fac))  as fac_ds, \
+             rasterio.open(str(fdr_path)) as fdr_ds:
 
-        # Warn on CRS mismatches
-        for label, ds_crs in [("DEM", dem_ds.crs), ("FAC", fac_ds.crs)]:
-            if shp_crs and ds_crs and shp_crs != ds_crs:
-                logger.warning(
-                    f"CRS mismatch: shapefile={shp_crs}, {label}={ds_crs}. "
-                    "Reproject your shapefile if results look incorrect."
-                )
+            # Warn on CRS mismatches
+            for label, ds_crs in [
+                ("DEM", dem_ds.crs),
+                ("FAC", fac_ds.crs),
+                ("FDR", fdr_ds.crs),
+            ]:
+                if shp_crs and ds_crs and shp_crs != ds_crs:
+                    logger.warning(
+                        f"CRS mismatch: shapefile={shp_crs}, {label}={ds_crs}. "
+                        "Reproject your shapefile if results look incorrect."
+                    )
 
-        for i, (geom, wid) in enumerate(features, start=1):
-            dem_out = output_dir / f"watershed_{wid}.tif"
-            fac_out = output_dir / f"watershed_{wid}_fac.tif"
-            fdr_out = output_dir / f"watershed_{wid}_fdr.tif"
+            for i, (geom, wid) in enumerate(features, start=1):
+                dem_out = output_dir / f"watershed_{wid}.tif"
+                fac_out = output_dir / f"watershed_{wid}_fac.tif"
+                fdr_out = output_dir / f"watershed_{wid}_fdr.tif"
 
-            dem_exists = dem_out.exists()
-            fac_exists = fac_out.exists()
-            fdr_exists = fdr_out.exists()
+                if dem_out.exists() and fac_out.exists() and fdr_out.exists():
+                    skipped += 1
+                    logger.info(
+                        f"[{i:3d}/{total}] SKIP  Watershed {wid} — all files exist"
+                    )
+                    continue
 
-            if dem_exists and fac_exists and fdr_exists:
-                skipped += 1
-                logger.info(f"[{i:3d}/{total}] SKIP  Watershed {wid} — both files exist")
-                continue
+                logger.info(f"[{i:3d}/{total}] START Watershed {wid}...")
+                tile_start = time.time()
 
-            logger.info(f"[{i:3d}/{total}] START Watershed {wid}...")
-            tile_start = time.time()
+                # Clip DEM
+                dem_ok = True
+                if not dem_out.exists():
+                    dem_ok, _ = clip_raster(dem_ds, geom, dem_out, logger=logger)
+                    if not dem_ok:
+                        logger.error(f"  DEM clip failed for watershed {wid}")
 
-            # Clip DEM
-            dem_ok = True
-            if not dem_exists:
-                dem_ok, _ = clip_raster(dem_ds, geom, dem_out, logger=logger)
-                if not dem_ok:
-                    logger.error(f"  DEM clip failed for watershed {wid}")
+                # Clip FAC (border-blanked version)
+                fac_ok = True
+                if not fac_out.exists():
+                    fac_ok, _ = clip_raster(
+                        fac_ds, geom, fac_out,
+                        nodata_override=-9999,
+                        logger=logger,
+                    )
+                    if not fac_ok:
+                        logger.error(f"  FAC clip failed for watershed {wid}")
 
-            # Clip FAC — use -9999 as nodata if the FAC has none defined
-            fac_ok = True
-            if not fac_exists:
-                fac_ok, _ = clip_raster(
-                    fac_ds, geom, fac_out,
-                    nodata_override=-9999,
-                    logger=logger,
-                )
-                if not fac_ok:
-                    logger.error(f"  FAC clip failed for watershed {wid}")
+                # Clip FDR
+                fdr_ok = True
+                if not fdr_out.exists():
+                    fdr_ok, _ = clip_raster(
+                        fdr_ds, geom, fdr_out,
+                        nodata_override=0,
+                        logger=logger,
+                    )
+                    if not fdr_ok:
+                        logger.error(f"  FDR clip failed for watershed {wid}")
 
-            # Clip FDR
-            fdr_ok = True
-            if not fdr_out.exists():
-                fdr_ok, _ = clip_raster(
-                    fdr_ds, geom, fdr_out,
-                    nodata_override=0,
-                    logger = logger,
-                )
-                if not fdr_ok:
-                    logger.error(f"  FDR clip failed for watershed {wid}")
+                if dem_ok and fac_ok and fdr_ok:
+                    # --------------------------------------------------
+                    # Mask the clipped FAC to the DEM's valid extent.
+                    # Cells outside the watershed polygon but inside the
+                    # bounding box retain non-zero FAC values from the
+                    # mosaic; zeroing them prevents off-channel ksn points.
+                    # --------------------------------------------------
+                    with rasterio.open(str(dem_out)) as dem_src:
+                        dem_arr    = dem_src.read(1)
+                        dem_nodata = dem_src.nodata
 
-            if dem_ok and fac_ok and fdr_ok:
-                # Mask the FAC to the DEM's valid extent.
-                # The full-mosaic FAC has valid accumulation values everywhere,
-                # so cells outside the watershed polygon but inside the bounding
-                # box carry over non-zero FAC values. Zeroing these out prevents
-                # off-channel ksn points in calculate_ksn.py.
-                with rasterio.open(str(dem_out)) as dem_src:
-                    dem_arr    = dem_src.read(1)
-                    dem_nodata = dem_src.nodata
+                    with rasterio.open(str(fac_out)) as fac_src:
+                        fac_meta = fac_src.meta.copy()
+                        fac_arr  = fac_src.read(1)
+                        fac_nd   = fac_src.nodata
 
-                with rasterio.open(str(fac_out)) as fac_src:
-                    fac_meta = fac_src.meta.copy()
-                    fac_arr  = fac_src.read(1)
-                    fac_nd   = fac_src.nodata
+                    if dem_nodata is not None:
+                        fill = fac_nd if fac_nd is not None else -9999
+                        fac_arr[dem_arr == dem_nodata] = fill
 
-                if dem_nodata is not None:
-                    fac_arr[dem_arr == dem_nodata] = fac_nd if fac_nd is not None else -9999
+                    with rasterio.open(str(fac_out), "w", **fac_meta) as dst:
+                        dst.write(fac_arr, 1)
 
-                with rasterio.open(str(fac_out), "w", **fac_meta) as dst:
-                    dst.write(fac_arr, 1)
+                    succeeded += 1
+                    tile_time = time.time() - tile_start
+                    dem_mb    = dem_out.stat().st_size / 1024 / 1024
+                    fac_mb    = fac_out.stat().st_size / 1024 / 1024
+                    fdr_mb    = fdr_out.stat().st_size / 1024 / 1024
+                    elapsed   = time.time() - start_time
+                    rate      = i / elapsed
+                    eta_min   = (total - i) / rate / 60 if rate > 0 else 0
+                    logger.info(
+                        f"[{i:3d}/{total}] OK    Watershed {wid}  |  "
+                        f"DEM {dem_mb:.1f} MB  "
+                        f"FAC {fac_mb:.1f} MB  "
+                        f"FDR {fdr_mb:.1f} MB  |  "
+                        f"{tile_time:.1f}s  |  ETA {eta_min:.1f} min"
+                    )
+                else:
+                    failed += 1
+                    logger.error(f"[{i:3d}/{total}] FAIL  Watershed {wid}")
 
-                succeeded += 1
-                tile_time = time.time() - tile_start
-                dem_mb    = dem_out.stat().st_size / 1024 / 1024
-                fac_mb    = fac_out.stat().st_size / 1024 / 1024
-                elapsed   = time.time() - start_time
-                rate      = i / elapsed
-                eta_min   = (total - i) / rate / 60 if rate > 0 else 0
-                logger.info(
-                    f"[{i:3d}/{total}] OK    Watershed {wid}  |  "
-                    f"DEM {dem_mb:.1f} MB  FAC {fac_mb:.1f} MB  |  "
-                    f"{tile_time:.1f}s  |  ETA {eta_min:.1f} min"
-                )
-            else:
-                failed += 1
-                logger.error(f"[{i:3d}/{total}] FAIL  Watershed {wid}")
+    finally:
+        # Always clean up the temporary border-blanked FAC
+        tmp_fac.unlink(missing_ok=True)
 
     elapsed_total = time.time() - start_time
     logger.info("=" * 60)
@@ -298,7 +353,7 @@ def main():
     logger.info(f"  Output dir       : {output_dir}")
     logger.info(f"  Total time       : {elapsed_total / 60:.1f} minutes")
     logger.info("")
-    logger.info("Watershed DEMs and FAC rasters ready for calculate_ksn.py.")
+    logger.info("Watershed DEMs, FAC, and FDR rasters ready for calculate_ksn.py.")
 
 
 if __name__ == "__main__":
