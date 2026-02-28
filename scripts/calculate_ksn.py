@@ -7,7 +7,7 @@ dependency on topotoolbox.
 
 Uses the WhiteboxTools flow accumulation and flow direction outputs
 that are already computed for each watershed, extracting stream points
-and calculating ksn = slope / (area^-theta) where theta = 0.45.
+and calculating ksn = slope * (area^theta) where theta = 0.45.
 
 Exports results as point shapefiles with ksn values as attributes.
 
@@ -15,7 +15,7 @@ USAGE:
     1. Edit the paths and parameters in the CONFIG section below.
     2. Ensure these are already computed for each watershed:
        - DEM (from clip_watersheds.py)
-       - Flow accumulation  
+       - Flow accumulation
        - Flow direction
     3. Run from an environment with geopandas:
        conda activate demenv  # or any env with geopandas, rasterio, scipy
@@ -32,6 +32,7 @@ from pathlib import Path
 
 import numpy as np
 import rasterio
+import rasterio.transform
 from rasterio.warp import reproject, Resampling
 from scipy.ndimage import generic_filter
 import geopandas as gpd
@@ -50,12 +51,12 @@ import config
 # CONFIG — Edit these before running
 # =============================================================================
 
-WBT_DIR            = config.DATA_SCRATCH_WBT                # WBT outputs (flow acc/dir)
-WATERSHED_DEMS_DIR = config.DATA_WATERSHEDS               # Watershed DEMs
-OUTPUT_DIR         = config.DATA_KSN                        # Output ksn shapefiles
+WBT_DIR            = config.DATA_SCRATCH_WBT      # WBT outputs (flow acc/dir)
+WATERSHED_DEMS_DIR = config.DATA_WATERSHEDS        # Watershed DEMs
+OUTPUT_DIR         = config.DATA_KSN               # Output ksn shapefiles
 
 FAC_FILE = "flow_accumulation.tif"   # Flow accumulation from WBT
-FDR_FILE = "flow_direction.tif"      # Flow direction from WBT (not actually needed)
+FDR_FILE = "flow_direction.tif"      # Flow direction from WBT
 
 # Ksn calculation parameters
 MIN_DRAINAGE_AREA_M2 = config.MIN_DRAINAGE_AREA_M2
@@ -82,29 +83,144 @@ def setup_logging(output_dir: Path) -> logging.Logger:
     return logging.getLogger(__name__)
 
 
-def calculate_gradient_smoothed(dem: np.ndarray, cellsize: float,
+def calculate_gradient_smoothed(dem: np.ndarray, nodata, cellsize: float,
                                  window_size: int = 5) -> np.ndarray:
     """
     Calculate slope using a smoothed gradient to reduce noise.
-    Uses a moving window mean before computing gradient.
+
+    Masks nodata values as NaN before smoothing so that nodata areas
+    (outside the watershed boundary) do not bleed into the kernel and
+    corrupt slope values at the watershed edge.
+
+    Uses a moving-window nanmean before computing gradient.
     Returns slope in m/m.
     """
-    # Smooth DEM first using mean filter
-    smoothed = generic_filter(dem, np.nanmean, size=window_size, mode='nearest')
-    
+    # FIX: mask nodata to NaN before smoothing so nodata areas don't
+    # bleed into the kernel and corrupt slopes at the watershed edge.
+    dem_masked = dem.astype(np.float32)
+    if nodata is not None:
+        dem_masked[dem == nodata] = np.nan
+
+    # Smooth DEM using nanmean filter
+    smoothed = generic_filter(dem_masked, np.nanmean, size=window_size, mode='nearest')
+
     # Calculate gradients using central differences
     dy, dx = np.gradient(smoothed, cellsize)
-    
+
     # Calculate slope magnitude
     slope = np.sqrt(dx**2 + dy**2)
-    
+
     return slope
 
-def extract_stream_points(dem_path: Path, fac_path: Path,
-                        min_area_m2: float, sample_dist: float,
-                        theta: float, window_size: int,
-                        logger: logging.Logger) -> gpd.GeoDataFrame:
-    # 1. Load the Watershed DEM
+
+def _build_upstream_index(fdr_arr: np.ndarray, fdr_nodata,
+                           stream_mask: np.ndarray) -> dict:
+    """
+    Build a dict mapping each stream cell (r, c) to its list of upstream
+    stream-cell neighbours, using the WBT ESRI D8 pointer convention.
+
+    Used to trace flow paths from outlet to headwater for ordered sampling.
+    """
+    # WBT ESRI D8 pointer: value -> (row_offset, col_offset) of the cell
+    # that the current cell drains INTO. To find upstream neighbours we
+    # invert: a neighbour drains into us when its pointer equals the
+    # direction back toward us.
+    D8 = {
+        ( 0,  1): 1,
+        ( 1,  1): 2,
+        ( 1,  0): 4,
+        ( 1, -1): 8,
+        ( 0, -1): 16,
+        (-1, -1): 32,
+        (-1,  0): 64,
+        (-1,  1): 128,
+    }
+    # For each (dr, dc) neighbour offset, what FDR value in that neighbour
+    # means it drains toward the current cell (i.e. its pointer is the
+    # reverse direction)?
+    UPSTREAM_FDR = {(dr, dc): D8[(-dr, -dc)] for (dr, dc) in D8 if (-dr, -dc) in D8}
+
+    nrows, ncols = fdr_arr.shape
+    upstream = {}
+
+    skel_rows, skel_cols = np.where(stream_mask)
+    stream_set = set(zip(skel_rows.tolist(), skel_cols.tolist()))
+
+    for r, c in stream_set:
+        ups = []
+        for (dr, dc), expected_fdr in UPSTREAM_FDR.items():
+            nr, nc = r + dr, c + dc
+            if not (0 <= nr < nrows and 0 <= nc < ncols):
+                continue
+            if (nr, nc) not in stream_set:
+                continue
+            cell_fdr = int(fdr_arr[nr, nc])
+            if fdr_nodata is not None and cell_fdr == int(fdr_nodata):
+                continue
+            if cell_fdr == expected_fdr:
+                ups.append((nr, nc))
+        upstream[(r, c)] = ups
+
+    return upstream
+
+
+def _trace_channel_ordered(outlet_rc: tuple, upstream: dict,
+                            transform, sample_dist_m: float,
+                            cellsize: float) -> list:
+    """
+    Walk the stream network upstream from outlet_rc using BFS, collecting
+    cells in downstream-to-upstream order and sub-sampling at approximately
+    sample_dist_m intervals along the channel path.
+
+    Returns a list of (row, col) tuples spaced ~sample_dist_m apart,
+    starting at the outlet.
+    """
+    from collections import deque
+
+    sample_step = max(1, int(sample_dist_m / cellsize))
+    visited     = set()
+    result      = []
+    step_count  = 0
+
+    queue = deque([(outlet_rc, 0)])  # (cell, distance_steps_from_last_sample)
+
+    while queue:
+        cell, steps_since_sample = queue.popleft()
+        if cell in visited:
+            continue
+        visited.add(cell)
+
+        steps_since_sample += 1
+        if steps_since_sample >= sample_step or cell == outlet_rc:
+            result.append(cell)
+            steps_since_sample = 0
+
+        for up_cell in upstream.get(cell, []):
+            if up_cell not in visited:
+                queue.append((up_cell, steps_since_sample))
+
+    return result
+
+
+def extract_stream_points(dem_path: Path, fac_path: Path, fdr_path: Path,
+                           min_area_m2: float, sample_dist: float,
+                           theta: float, window_size: int,
+                           logger: logging.Logger) -> gpd.GeoDataFrame:
+    """
+    Extract ksn sample points for a single watershed DEM.
+
+    Changes vs. previous version:
+      - Nodata cells are masked to NaN before slope smoothing (FIX 1)
+      - Grid alignment between FAC and DEM is logged with a warning if
+        mismatched (FIX 2)
+      - Stream pixels are traced along the D8 flow path and sampled at
+        regular channel-distance intervals rather than scan-order (FIX 3)
+      - Points with nodata DEM, non-finite slope, or non-positive ksn are
+        filtered out before export (FIX 4)
+    """
+    # ------------------------------------------------------------------
+    # 1. Load watershed DEM
+    # ------------------------------------------------------------------
     with rasterio.open(str(dem_path)) as src:
         dem       = src.read(1)
         transform = src.transform
@@ -112,12 +228,20 @@ def extract_stream_points(dem_path: Path, fac_path: Path,
         cellsize  = src.res[0]
         nodata    = src.nodata
 
-    # 2. Match the FAC to the DEM pixel-for-pixel
+    # ------------------------------------------------------------------
+    # 2. Load and align FAC to DEM grid
+    # ------------------------------------------------------------------
     with rasterio.open(str(fac_path)) as fac_src:
-        # Create an empty array the same shape as your DEM
+        # FIX: warn if the FAC and DEM grids don't already match — a
+        # subtle misalignment causes nearest-neighbour resampling to shift
+        # accumulation values by one cell at stream threshold boundaries.
+        if fac_src.transform != transform or fac_src.shape != dem.shape:
+            logger.warning(
+                f"  FAC/DEM grid mismatch — reprojecting. "
+                f"FAC: {fac_src.shape} | DEM: {dem.shape}"
+            )
+
         fac = np.zeros(dem.shape, dtype=np.float32)
-        
-        # Reproject/Resample the FAC to match the DEM's grid exactly
         reproject(
             source=rasterio.band(fac_src, 1),
             destination=fac,
@@ -125,116 +249,172 @@ def extract_stream_points(dem_path: Path, fac_path: Path,
             src_crs=fac_src.crs,
             dst_transform=transform,
             dst_crs=crs,
-            resampling=Resampling.nearest # Maintain exact accumulation values
+            resampling=Resampling.nearest,
         )
-    
-        # 3. Calculate drainage area
-        area_m2 = fac * (cellsize ** 2)
-    
-    # DEBUG: Log the maximum area found in this specific watershed
-    logger.info(f"  Max area in DEM: {np.nanmax(area_m2):.2f} m2 | Threshold: {min_area_m2} m2")
-    
-    stream_mask = area_m2 >= min_area_m2
 
-    
+    area_m2 = fac * (cellsize ** 2)
+
+    logger.info(
+        f"  Max area in DEM: {np.nanmax(area_m2):.2f} m²  "
+        f"| Threshold: {min_area_m2:.2f} m²"
+    )
+
+    stream_mask = area_m2 >= min_area_m2
     if not stream_mask.any():
-        logger.warning(f"  No stream cells above threshold")
+        logger.warning("  No stream cells above threshold")
         return None
-    
-    # Calculate slope
-    logger.info(f"  Computing slope...")
-    slope = calculate_gradient_smoothed(dem, cellsize, window_size)
-    
-    # Calculate ksn = slope / (area^-theta)
-    logger.info(f"  Computing ksn...")
-    area_safe = np.maximum(area_m2, 1.0)  # Avoid division by zero
-    ksn = slope / (area_safe ** (-theta))
-    
-    # Handle infinities and NaNs
-    ksn = np.where(np.isfinite(ksn), ksn, 0)
-    
-    # Extract stream pixel coordinates and values
-    rows, cols = np.where(stream_mask)
-    
-    # Convert row/col to coordinates
-    xs, ys = rasterio.transform.xy(transform, rows, cols)
-    
-    # Sample every N meters approximately
-    # At 2m resolution, this means every sample_dist/2 pixels
-    sample_step = max(1, int(sample_dist / cellsize))
-    sampled_indices = np.arange(0, len(xs), sample_step)
-    
-    xs_sampled = [xs[i] for i in sampled_indices]
-    ys_sampled = [ys[i] for i in sampled_indices]
-    ksn_sampled = [ksn[rows[i], cols[i]] for i in sampled_indices]
-    slope_sampled = [slope[rows[i], cols[i]] for i in sampled_indices]
-    area_sampled = [area_m2[rows[i], cols[i]] / 1e6 for i in sampled_indices]  # Convert to km²
-    
-    # Build GeoDataFrame
-    points = [Point(x, y) for x, y in zip(xs_sampled, ys_sampled)]
-    gdf = gpd.GeoDataFrame({
-        'ksn':      ksn_sampled,
-        'slope':    slope_sampled,
-        'area_km2': area_sampled
-    }, geometry=points, crs=crs)
-    
+
+    # ------------------------------------------------------------------
+    # 3. Load FDR for channel-ordered sampling
+    # ------------------------------------------------------------------
+    with rasterio.open(str(fdr_path)) as fdr_src:
+        fdr_raw    = np.zeros(dem.shape, dtype=np.int32)
+        fdr_nodata = fdr_src.nodata
+        reproject(
+            source=rasterio.band(fdr_src, 1),
+            destination=fdr_raw,
+            src_transform=fdr_src.transform,
+            src_crs=fdr_src.crs,
+            dst_transform=transform,
+            dst_crs=crs,
+            resampling=Resampling.nearest,
+        )
+
+    # ------------------------------------------------------------------
+    # 4. Compute slope with nodata-aware smoothing
+    # ------------------------------------------------------------------
+    logger.info("  Computing slope...")
+    slope = calculate_gradient_smoothed(dem, nodata, cellsize, window_size)
+
+    # ------------------------------------------------------------------
+    # 5. Compute ksn = slope * area^theta
+    #    (equivalent to slope / area^-theta but written more clearly)
+    # ------------------------------------------------------------------
+    logger.info("  Computing ksn...")
+    area_safe = np.maximum(area_m2, 1.0)   # avoid log(0) / division by zero
+    ksn = slope * (area_safe ** theta)
+
+    # Replace non-finite values with 0
+    ksn = np.where(np.isfinite(ksn), ksn, 0.0)
+
+    # ------------------------------------------------------------------
+    # FIX: filter invalid pixels before sampling — removes nodata DEM
+    # cells, non-finite slopes, and zero/negative ksn values that would
+    # otherwise appear as spurious points in the output shapefile.
+    # ------------------------------------------------------------------
+    stream_rows, stream_cols = np.where(stream_mask)
+    valid_mask = (
+        (nodata is None or dem[stream_rows, stream_cols] != nodata) &
+        np.isfinite(slope[stream_rows, stream_cols]) &
+        np.isfinite(ksn[stream_rows, stream_cols]) &
+        (ksn[stream_rows, stream_cols] > 0)
+    )
+    stream_rows = stream_rows[valid_mask]
+    stream_cols = stream_cols[valid_mask]
+
+    if len(stream_rows) == 0:
+        logger.warning("  No valid stream cells after filtering")
+        return None
+
+    valid_stream_mask = np.zeros(dem.shape, dtype=bool)
+    valid_stream_mask[stream_rows, stream_cols] = True
+
+    # ------------------------------------------------------------------
+    # FIX: sample along D8 flow paths rather than in raster scan order.
+    # Build upstream index, find the outlet cell (highest FAC), then BFS
+    # upstream collecting points at ~sample_dist intervals along the channel.
+    # ------------------------------------------------------------------
+    logger.info("  Tracing channel paths for ordered sampling...")
+    upstream = _build_upstream_index(fdr_raw, fdr_nodata, valid_stream_mask)
+
+    # Outlet = valid stream cell with the highest FAC value
+    fac_at_stream = area_m2[stream_rows, stream_cols]
+    outlet_idx    = int(np.argmax(fac_at_stream))
+    outlet_rc     = (int(stream_rows[outlet_idx]), int(stream_cols[outlet_idx]))
+
+    sampled_cells = _trace_channel_ordered(
+        outlet_rc, upstream, transform, sample_dist, cellsize
+    )
+
+    if not sampled_cells:
+        logger.warning("  Channel tracing produced no sample points")
+        return None
+
+    logger.info(f"  {len(sampled_cells)} sample points along channel paths")
+
+    # ------------------------------------------------------------------
+    # 6. Build output GeoDataFrame
+    # ------------------------------------------------------------------
+    s_rows = [rc[0] for rc in sampled_cells]
+    s_cols = [rc[1] for rc in sampled_cells]
+
+    xs, ys = rasterio.transform.xy(transform, s_rows, s_cols)
+
+    points = [Point(x, y) for x, y in zip(xs, ys)]
+    gdf = gpd.GeoDataFrame(
+        {
+            "ksn":      [float(ksn[r, c])       for r, c in sampled_cells],
+            "slope":    [float(slope[r, c])      for r, c in sampled_cells],
+            "area_km2": [float(area_m2[r, c]) / 1e6 for r, c in sampled_cells],
+        },
+        geometry=points,
+        crs=crs,
+    )
+
     return gdf
 
 
-def calculate_ksn_for_watershed(dem_path: Path, fac_path: Path,
-                                output_dir: Path, logger: logging.Logger) -> tuple[bool, str]:
+def calculate_ksn_for_watershed(dem_path: Path, fac_path: Path, fdr_path: Path,
+                                 output_dir: Path,
+                                 logger: logging.Logger) -> tuple[bool, str]:
     """
     Calculates ksn for a single watershed DEM and exports to shapefile.
     Returns (success, output_path).
     """
-    watershed_id = dem_path.stem  # e.g. "watershed_1"
+    watershed_id = dem_path.stem   # e.g. "watershed_1"
     out_shp      = output_dir / f"{watershed_id}_ksn.shp"
-    
-    # Skip if already exists
+
     if out_shp.exists():
         return (True, str(out_shp))
-    
+
     try:
-        logger.info(f"  Extracting stream points...")
+        logger.info("  Extracting stream points...")
         gdf = extract_stream_points(
-            dem_path, fac_path,
+            dem_path, fac_path, fdr_path,
             MIN_DRAINAGE_AREA_M2, SAMPLE_DISTANCE,
             REFERENCE_CONCAVITY, SMOOTHING_WINDOW,
-            logger
+            logger,
         )
-        
+
         if gdf is None or len(gdf) == 0:
-            logger.warning(f"  No streams found — skipping")
+            logger.warning("  No streams found — skipping")
             return (False, "")
-        
-        # Export to shapefile
-        logger.info(f"  Exporting to shapefile...")
+
+        logger.info("  Exporting to shapefile...")
         gdf.to_file(str(out_shp))
-        
+
         point_count = len(gdf)
-        ksn_mean    = gdf['ksn'].mean()
-        ksn_std     = gdf['ksn'].std()
-        
+        ksn_mean    = gdf["ksn"].mean()
+        ksn_std     = gdf["ksn"].std()
+
         logger.info(
             f"  Exported {point_count} points  |  "
             f"ksn mean: {ksn_mean:.1f}  |  "
             f"ksn std: {ksn_std:.1f}"
         )
-        
         return (True, str(out_shp))
-        
+
     except Exception as e:
         logger.error(f"  Failed: {e}")
         import traceback
         logger.error(traceback.format_exc())
-        if out_shp.exists():
-            try:
-                for ext in ['.shp', '.shx', '.dbf', '.prj', '.cpg']:
-                    f = out_shp.parent / (out_shp.stem + ext)
-                    if f.exists():
-                        f.unlink()
-            except Exception:
-                pass
+        for ext in [".shp", ".shx", ".dbf", ".prj", ".cpg"]:
+            f = out_shp.parent / (out_shp.stem + ext)
+            if f.exists():
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
         return (False, "")
 
 
@@ -243,72 +423,73 @@ def main():
     dems_dir   = Path(WATERSHED_DEMS_DIR)
     output_dir = Path(OUTPUT_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     logger = setup_logging(output_dir)
-    
+
     fac_path = wbt_dir / FAC_FILE
-    
+    fdr_path = wbt_dir / FDR_FILE
+
     # Validate inputs
-    if not fac_path.exists():
-        logger.error(f"Flow accumulation not found: {fac_path}")
-        logger.error("Run wbt_hydrology.py first.")
-        sys.exit(1)
-    
+    for label, path in [("Flow accumulation", fac_path), ("Flow direction", fdr_path)]:
+        if not path.exists():
+            logger.error(f"{label} not found: {path}")
+            logger.error("Run wbt_hydrology.py first.")
+            sys.exit(1)
+
     # Collect watershed DEMs
     dem_files = sorted(dems_dir.glob("watershed_*.tif"))
     if not dem_files:
         logger.error(f"No watershed_*.tif files found in: {dems_dir}")
         logger.error("Run clip_watersheds.py first.")
         sys.exit(1)
-    
+
     total = len(dem_files)
     logger.info(f"Found {total} watershed DEMs")
     logger.info(f"Input DEMs           : {dems_dir}")
     logger.info(f"Flow accumulation    : {fac_path}")
+    logger.info(f"Flow direction       : {fdr_path}")
     logger.info(f"Output dir           : {output_dir}")
-    logger.info(f"Min drainage area    : {MIN_DRAINAGE_AREA_M2/1e6:.3f} km²")
+    logger.info(f"Min drainage area    : {MIN_DRAINAGE_AREA_M2 / 1e6:.3f} km²")
     logger.info(f"Reference concavity  : {REFERENCE_CONCAVITY}")
     logger.info(f"Smoothing window     : {SMOOTHING_WINDOW} cells")
     logger.info(f"Sample distance      : {SAMPLE_DISTANCE} m")
     logger.info("-" * 60)
-    
+
     start_time = time.time()
     succeeded  = 0
     failed     = 0
     skipped    = 0
-    
+
     for i, dem_path in enumerate(dem_files, start=1):
         watershed_id = dem_path.stem
-        
-        out_shp = output_dir / f"{watershed_id}_ksn.shp"
+        out_shp      = output_dir / f"{watershed_id}_ksn.shp"
+
         if out_shp.exists():
             skipped += 1
             logger.info(f"[{i:3d}/{total}] SKIP  {watershed_id} — already exists")
             continue
-        
+
         logger.info(f"[{i:3d}/{total}] START {watershed_id}")
         tile_start = time.time()
-        
+
         success, result = calculate_ksn_for_watershed(
-            dem_path, fac_path, output_dir, logger
+            dem_path, fac_path, fdr_path, output_dir, logger
         )
-        
+
         if success:
             succeeded += 1
             tile_time = time.time() - tile_start
             elapsed   = time.time() - start_time
             rate      = i / elapsed
             eta_min   = (total - i) / rate / 60 if rate > 0 else 0
-            
             logger.info(
                 f"[{i:3d}/{total}] OK    {watershed_id}  |  "
-                f"{tile_time:.1f}s  |  "
-                f"ETA {eta_min:.1f} min"
+                f"{tile_time:.1f}s  |  ETA {eta_min:.1f} min"
             )
         else:
             failed += 1
             logger.error(f"[{i:3d}/{total}] FAIL  {watershed_id}")
-    
+
     elapsed_total = time.time() - start_time
     logger.info("=" * 60)
     logger.info("COMPLETE")
@@ -319,7 +500,7 @@ def main():
     logger.info(f"  Output dir       : {output_dir}")
     logger.info(f"  Total time       : {elapsed_total / 60:.1f} minutes")
     logger.info("")
-    logger.info("Load *_ksn.shp files in ArcGIS Pro to visualize ksn values.")
+    logger.info("Load *_ksn.shp files in ArcGIS Pro or QGIS to visualize ksn values.")
 
 
 if __name__ == "__main__":
