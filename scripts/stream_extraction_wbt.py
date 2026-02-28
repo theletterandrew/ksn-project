@@ -310,6 +310,13 @@ def main():
 
         valid_mask  = (fac_data != nodata) if nodata is not None else np.ones_like(fac_data, dtype=bool)
         stream_mask = (fac_data >= THRESHOLD) & valid_mask
+        if config.BORDER_CELLS > 0:
+            b = config.BORDER_CELLS
+            stream_mask[:b,  :] = False   # top
+            stream_mask[-b:, :] = False   # bottom
+            stream_mask[:,  :b] = False   # left
+            stream_mask[:, -b:] = False   # right
+            logger.info(f"  Blanked {b}-cell border to suppress edge artifacts")
         pixel_count = int(stream_mask.sum())
         logger.info(f"  Stream pixels above threshold: {pixel_count:,}")
         del fac_data, valid_mask
