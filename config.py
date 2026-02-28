@@ -100,7 +100,7 @@ MIN_WATERSHED_AREA = 10000 if TEST_RUN else 10000000
 
 # Pour points are snapped to the highest flow accumulation cell within
 # this distance to ensure they land exactly on the stream
-SNAP_DISTANCE = 50
+SNAP_DISTANCE = 5 if TEST_RUN else 50
 
 # --- STREAM EXTRACTION PARAMETERS ---
 STREAM_THRESHOLD        = 50000 if TEST_RUN else 1000000
