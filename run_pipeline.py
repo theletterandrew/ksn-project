@@ -39,7 +39,7 @@ SCRIPTS_TO_RUN = [
     # "wbt_hydrology.py",
     # "stream_extraction_wbt.py",
     # "delineate_watersheds.py",
-    # "clip_watersheds.py",
+    "clip_watersheds.py",
     "calculate_ksn.py",
     # "plot_stream_profiles.py"
 ]
