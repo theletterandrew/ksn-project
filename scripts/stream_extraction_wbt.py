@@ -392,6 +392,13 @@ def main():
         logger.info("Step 4: Tracing skeleton into line segments...")
         adj      = build_adjacency(skeleton)
         segments = trace_segments(adj)
+        # DEBUG
+        junction_count = sum(1 for n, nbrs in adj.items() if len(nbrs) >= 3)
+        endpoint_count = sum(1 for n, nbrs in adj.items() if len(nbrs) == 1)
+        interior_count = sum(1 for n, nbrs in adj.items() if len(nbrs) == 2)
+        logger.info(f"  Graph nodes — endpoints: {endpoint_count}, junctions: {junction_count}, interior: {interior_count}")
+        logger.info(f"  Avg segment length: {sum(len(s) for s in segments)/max(len(segments),1):.1f} pixels")
+        logger.info(f"  Max segment length: {max(len(s) for s in segments)} pixels")
         logger.info(f"  Raw segments traced: {len(segments):,}")
 
         # Filter short stubs
