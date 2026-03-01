@@ -403,39 +403,34 @@ def pixels_to_linestring(chain: list, transform) -> LineString:
 
 def build_directed_segment_graph(lines: list):
     """
-    Build a *directed* node graph from (seg, LineString) pairs.
+    Build a *directed* node graph from (seg, LineString) pairs using the
+    integer pixel coordinates from the raw pixel chains, not the floating-
+    point map coordinates.
 
-    Segments are already ordered mouth->source (index 0 = downstream end),
-    so each segment contributes exactly one directed edge:
-        mouth_node  -->  source_node
+    Pixel coordinates are exact integers so there is no float-jitter problem.
+    Segments are already ordered mouth->source (seg[0] = downstream pixel),
+    so each segment contributes one directed edge:
+        mouth_pixel  -->  source_pixel
 
     Returns
     -------
-    upstream : {node: [(upstream_neighbour, seg_index, length_m), ...]}
-        Follow these edges to travel upstream (mouth -> headwater).
-    downstream : {node: [(downstream_neighbour, seg_index, length_m), ...]}
-        Follow these edges to travel downstream (headwater -> mouth).
-    mouth_nodes : set of nodes that have no incoming upstream edge —
-        i.e. true outlets (nothing drains into them from downstream).
+    upstream   : {pixel: [(upstream_pixel, seg_index, length_m), ...]}
+    downstream : {pixel: [(downstream_pixel, seg_index, length_m), ...]}
+    mouth_nodes: set of pixels that are true outlets (no downstream inflow)
     """
-    def _pt(coord):
-        return (round(coord[0], 4), round(coord[1], 4))
-
-    upstream   = defaultdict(list)   # node -> [(upstream_nb, idx, len), ...]
-    downstream = defaultdict(list)   # node -> [(downstream_nb, idx, len), ...]
+    upstream   = defaultdict(list)
+    downstream = defaultdict(list)
     all_nodes  = set()
 
     for i, (seg, line) in enumerate(lines):
-        coords = list(line.coords)
-        mouth  = _pt(coords[0])   # index 0 = downstream / mouth end
-        source = _pt(coords[-1])  # last   = upstream  / headwater end
+        mouth  = seg[0]   # (row, col) — downstream end
+        source = seg[-1]  # (row, col) — upstream / headwater end
         length = line.length
-        upstream[mouth].append((source, i, length))    # mouth -> source
-        downstream[source].append((mouth, i, length))  # source -> mouth
+        upstream[mouth].append((source, i, length))
+        downstream[source].append((mouth, i, length))
         all_nodes.update([mouth, source])
 
-    # Outlet nodes: nodes that nothing flows *into* from downstream,
-    # i.e. they have no entry in downstream[] — they are the true mouths.
+    # True outlets: pixels nothing flows *into* from downstream
     mouth_nodes = all_nodes - set(downstream.keys())
 
     return dict(upstream), dict(downstream), mouth_nodes
@@ -508,10 +503,7 @@ def extract_longest_branch(
     if not upstream_graph:
         logger.warning("  Segment graph is empty — skipping longest branch.")
         return
-    logger.info(f"  Total nodes in graph: {len(upstream_graph)}")
-    logger.info(f"  Mouth nodes found: {len(mouth_nodes)}")
-    for mn in list(mouth_nodes)[:5]:
-        logger.info(f"    mouth candidate: {mn}")
+
     # If no clean outlet found (e.g. every node has a downstream neighbour
     # because all outlets were filtered), fall back to the node with the
     # lowest total upstream degree as a best-guess outlet.
