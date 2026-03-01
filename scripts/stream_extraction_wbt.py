@@ -168,6 +168,87 @@ def build_adjacency(skeleton: np.ndarray) -> dict:
     return dict(adj)
 
 
+def collapse_junction_clusters(adj: dict) -> dict:
+    """
+    Morphological skeletonization often produces small clusters of 2-4
+    mutually-adjacent pixels at branch points instead of a single junction
+    pixel.  Every pixel in such a cluster has 3+ neighbours and they all
+    connect to each other, creating spurious 2-3 pixel "segments" between
+    junction pixels that fragment the network.
+
+    This function collapses each such cluster into a single representative
+    node (the centroid pixel, chosen by median row/col) and rewires all
+    external neighbours to that node, returning a cleaned adjacency dict.
+
+    Algorithm
+    ---------
+    1. Find all junction pixels (degree >= 3).
+    2. Union-find: merge junctions that are direct neighbours of each other
+       into clusters.
+    3. For each cluster pick a representative (pixel closest to centroid).
+    4. Rewrite the adjacency dict, replacing every cluster member with its
+       representative and removing self-loops.
+    """
+    junctions = {n for n, nbrs in adj.items() if len(nbrs) >= 3}
+
+    # --- Union-Find over junction pixels that are adjacent to each other ---
+    parent = {j: j for j in junctions}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        parent[find(a)] = find(b)
+
+    for j in junctions:
+        for nb in adj.get(j, []):
+            if nb in junctions:
+                union(j, nb)
+
+    # Group cluster members by root
+    clusters = defaultdict(set)
+    for j in junctions:
+        clusters[find(j)].add(j)
+
+    # Pick the representative: pixel nearest to the integer centroid
+    remap = {}
+    for root, members in clusters.items():
+        if len(members) == 1:
+            remap[next(iter(members))] = next(iter(members))
+            continue
+        cr = int(round(sum(r for r, c in members) / len(members)))
+        cc = int(round(sum(c for r, c in members) / len(members)))
+        rep = min(members, key=lambda p: (p[0] - cr) ** 2 + (p[1] - cc) ** 2)
+        for m in members:
+            remap[m] = rep
+
+    if not any(v != k for k, v in remap.items()):
+        # No clusters to collapse — return unchanged
+        return adj
+
+    # Rewrite adjacency: replace every remapped node, drop self-loops and dups
+    new_adj = defaultdict(set)
+    cluster_members = set(remap.keys())
+
+    for node, nbrs in adj.items():
+        new_node = remap.get(node, node)
+        for nb in nbrs:
+            new_nb = remap.get(nb, nb)
+            if new_node != new_nb:
+                new_adj[new_node].add(new_nb)
+
+    # Ensure all nodes present even if they have no neighbours after remap
+    for node in adj:
+        new_node = remap.get(node, node)
+        if new_node not in new_adj:
+            new_adj[new_node] = set()
+
+    return {k: list(v) for k, v in new_adj.items()}
+
+
 def trace_segments(adj: dict) -> list:
     """
     Walk the adjacency graph and extract linear pixel chains (segments).
@@ -178,8 +259,8 @@ def trace_segments(adj: dict) -> list:
     Returns a list of pixel chains: [[(r,c), (r,c), ...], ...]
     """
     # Classify nodes
-    endpoints  = {n for n, nbrs in adj.items() if len(nbrs) == 1}
-    junctions  = {n for n, nbrs in adj.items() if len(nbrs) >= 3}
+    endpoints   = {n for n, nbrs in adj.items() if len(nbrs) == 1}
+    junctions   = {n for n, nbrs in adj.items() if len(nbrs) >= 3}
     start_nodes = endpoints | junctions
 
     visited_edges = set()
@@ -192,13 +273,12 @@ def trace_segments(adj: dict) -> list:
 
         while True:
             nbrs = [n for n in adj.get(curr, []) if n != prev]
-            # Stop at a junction — but include the junction pixel itself so
-            # adjacent segments share the same endpoint coordinate and the
-            # network is topologically connected (no 1-pixel gaps at nodes).
+            # Stop at a junction — include it so adjacent segments share
+            # the same endpoint and the network is topologically connected.
             if curr in junctions:
                 chain.append(curr)
                 break
-            # Stop at dead-end or already-visited fork
+            # Stop at dead-end
             if not nbrs:
                 break
             if len(nbrs) == 1:
@@ -211,7 +291,7 @@ def trace_segments(adj: dict) -> list:
                 prev, curr = curr, nxt
             else:
                 # len(nbrs) > 1 but curr not classified as junction —
-                # shouldn't happen post-skeletonization, but stop safely.
+                # shouldn't happen post-collapse, but stop safely.
                 break
         return chain
 
@@ -240,11 +320,7 @@ def trace_segments(adj: dict) -> list:
             curr = nxt[0] if nxt else None
         segments.append(loop)
         remaining -= set(loop)
-    # DEBUG: log first 10 segment start/end pixels and lengths
-    import logging
-    log = logging.getLogger(__name__)
-    for i, seg in enumerate(segments[:10]):
-        log.info(f"  seg[{i}]: len={len(seg)}  head={seg[0]}  tail={seg[-1]}")
+
     return segments
 
 
@@ -394,19 +470,22 @@ def main():
         # Step 4: Build adjacency graph and trace segments
         # ------------------------------------------------------------------
         logger.info("Step 4: Tracing skeleton into line segments...")
-        adj      = build_adjacency(skeleton)
-        junction_nodes = {n for n, nbrs in adj.items() if len(nbrs) >= 3}
-        sample = list(junction_nodes)[:3]
-        for jn in sample:
-            logger.info(f"  Junction {jn}: neighbors = {adj[jn]}")
+        adj = build_adjacency(skeleton)
+
+        # Collapse junction-pixel clusters produced by skeletonization.
+        # Morphological thinning often leaves 2-4 mutually-adjacent pixels at
+        # branch points instead of a single node, creating spurious 2-3 px
+        # segments that fragment the network.  Collapsing them first ensures
+        # every branch point is represented by exactly one pixel.
+        junc_before = sum(1 for nbrs in adj.values() if len(nbrs) >= 3)
+        adj = collapse_junction_clusters(adj)
+        junc_after  = sum(1 for nbrs in adj.values() if len(nbrs) >= 3)
+        if junc_before != junc_after:
+            logger.info(
+                f"  Junction clusters collapsed: {junc_before} -> {junc_after} junction pixels"
+            )
+
         segments = trace_segments(adj)
-        # DEBUG
-        junction_count = sum(1 for n, nbrs in adj.items() if len(nbrs) >= 3)
-        endpoint_count = sum(1 for n, nbrs in adj.items() if len(nbrs) == 1)
-        interior_count = sum(1 for n, nbrs in adj.items() if len(nbrs) == 2)
-        logger.info(f"  Graph nodes — endpoints: {endpoint_count}, junctions: {junction_count}, interior: {interior_count}")
-        logger.info(f"  Avg segment length: {sum(len(s) for s in segments)/max(len(segments),1):.1f} pixels")
-        logger.info(f"  Max segment length: {max(len(s) for s in segments)} pixels")
         logger.info(f"  Raw segments traced: {len(segments):,}")
 
         # Filter short stubs
