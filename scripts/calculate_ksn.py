@@ -378,6 +378,30 @@ def extract_stream_points(
     # ------------------------------------------------------------------
     # 9. Remove dangling tributary tips shorter than MIN_TRIBUTARY_LENGTH_M
     # ------------------------------------------------------------------
+
+    # DIAGNOSTIC — remove after diagnosis
+    _downstream_debug = {}
+    for _cell, _ups in upstream.items():
+        for _up in _ups:
+            _downstream_debug[_up] = _cell
+    _headwaters_debug = [c for c in set(sampled_cells) if not upstream.get(c)]
+    logger.info(f"  PRE-FILTER headwater sampled cells: {len(_headwaters_debug)}")
+    for _tip in _headwaters_debug[:10]:
+        _current = _tip
+        _steps = 0
+        while True:
+            _ds = _downstream_debug.get(_current)
+            if _ds is None:
+                break
+            _steps += 1
+            if len(upstream.get(_ds, [])) > 1:
+                break
+            if _ds not in set(sampled_cells):
+                break
+            _current = _ds
+        logger.info(f"    tip={_tip} steps_to_junction={_steps} min_steps={int(MIN_TRIBUTARY_LENGTH_M / cellsize)}")
+    # END DIAGNOSTIC
+
     if MIN_TRIBUTARY_LENGTH_M > 0:
         before = len(sampled_cells)
         sampled_cells = _filter_short_tributaries(
@@ -389,28 +413,6 @@ def extract_stream_points(
                 f"  Dropped {dropped_tribs} points on short tributaries "
                 f"(< {MIN_TRIBUTARY_LENGTH_M:.0f} m)"
             )
-    # DIAGNOSTIC
-    headwaters_debug = [c for c in set(sampled_cells) if not upstream.get(c)]
-    logger.info(f"  Headwater sampled cells: {len(headwaters_debug)}")
-    for tip in headwaters_debug[:5]:
-        downstream_debug = {}
-        for cell, ups in upstream.items():
-            for up in ups:
-                downstream_debug[up] = cell
-        current = tip
-        steps = 0
-        while True:
-            ds = downstream_debug.get(current)
-            if ds is None:
-                break
-            steps += 1
-            if len(upstream.get(ds, [])) > 1:
-                break
-            if ds not in set(sampled_cells):
-                break
-            current = ds
-        logger.info(f"    tip={tip} steps_to_junction={steps} min_steps={int(MIN_TRIBUTARY_LENGTH_M / cellsize)}")
-    # END DIAGNOSTIC
     
     if not sampled_cells:
         logger.warning("  All points removed by tributary length filter")
