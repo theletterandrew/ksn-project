@@ -49,10 +49,11 @@ WATERSHED_DEMS_DIR = config.DATA_WATERSHEDS   # Watershed DEMs + FAC + FDR raste
 OUTPUT_DIR         = config.DATA_KSN          # Output ksn shapefiles
 
 # Ksn calculation parameters
-MIN_DRAINAGE_AREA_M2 = config.MIN_DRAINAGE_AREA_M2
-REFERENCE_CONCAVITY  = config.REFERENCE_CONCAVITY
-SMOOTHING_WINDOW     = config.SMOOTHING_WINDOW
-SAMPLE_DISTANCE      = config.SAMPLE_DISTANCE
+MIN_DRAINAGE_AREA_M2   = config.MIN_DRAINAGE_AREA_M2
+REFERENCE_CONCAVITY    = config.REFERENCE_CONCAVITY
+SMOOTHING_WINDOW       = config.SMOOTHING_WINDOW
+SAMPLE_DISTANCE        = config.SAMPLE_DISTANCE
+MIN_TRIBUTARY_LENGTH_M = config.MIN_TRIBUTARY_LENGTH_M
 
 # =============================================================================
 # END CONFIG
@@ -180,6 +181,64 @@ def _trace_channel_ordered(
                 queue.append((up_cell, steps))
 
     return result
+
+
+def _filter_short_tributaries(
+    sampled_cells: list,
+    upstream: dict,
+    cellsize: float,
+    min_length_m: float,
+) -> list:
+    """
+    Remove sampled points on dangling tributary tips shorter than min_length_m.
+
+    A dangling tip is a headwater cell with no upstream neighbours. For each
+    tip we walk downstream until we reach a junction (a cell with 2+ upstream
+    neighbours) or the outlet, accumulating step count. If the tip-to-junction
+    distance is less than min_length_m, all sampled cells on that branch are
+    removed. The main stem and longer tributaries are always kept.
+    """
+    if min_length_m <= 0:
+        return sampled_cells
+
+    sampled_set = set(sampled_cells)
+    min_steps   = max(1, int(min_length_m / cellsize))
+
+    # Build downstream index (inverse of upstream)
+    downstream = {}
+    for cell, ups in upstream.items():
+        for up in ups:
+            downstream[up] = cell
+
+    # Headwaters: sampled cells with no upstream neighbours
+    headwaters = [c for c in sampled_set if not upstream.get(c)]
+
+    cells_to_remove = set()
+
+    for tip in headwaters:
+        branch  = [tip]
+        current = tip
+        steps   = 0
+
+        while True:
+            ds = downstream.get(current)
+            if ds is None:
+                # Reached the outlet — this is the main stem, keep it
+                branch = []
+                break
+            steps += 1
+            # Stop at a junction
+            if len(upstream.get(ds, [])) > 1:
+                break
+            if ds not in sampled_set:
+                break
+            branch.append(ds)
+            current = ds
+
+        if branch and steps < min_steps:
+            cells_to_remove.update(branch)
+
+    return [c for c in sampled_cells if c not in cells_to_remove]
 
 
 def extract_stream_points(
@@ -317,7 +376,26 @@ def extract_stream_points(
     logger.info(f"  {len(sampled_cells)} sample points along channel paths")
 
     # ------------------------------------------------------------------
-    # 9. Remove points that fall within 3 cells of the mosaic boundary.
+    # 9. Remove dangling tributary tips shorter than MIN_TRIBUTARY_LENGTH_M
+    # ------------------------------------------------------------------
+    if MIN_TRIBUTARY_LENGTH_M > 0:
+        before = len(sampled_cells)
+        sampled_cells = _filter_short_tributaries(
+            sampled_cells, upstream, cellsize, MIN_TRIBUTARY_LENGTH_M
+        )
+        dropped_tribs = before - len(sampled_cells)
+        if dropped_tribs:
+            logger.info(
+                f"  Dropped {dropped_tribs} points on short tributaries "
+                f"(< {MIN_TRIBUTARY_LENGTH_M:.0f} m)"
+            )
+
+    if not sampled_cells:
+        logger.warning("  All points removed by tributary length filter")
+        return None
+
+    # ------------------------------------------------------------------
+    # 10. Remove points within 3 cells of the mosaic boundary.
     #
     #    WBT D8 routing produces spurious high-accumulation values along
     #    the outermost rows/cols of the mosaic. Rather than blanking the
@@ -351,7 +429,7 @@ def extract_stream_points(
         return None
 
     # ------------------------------------------------------------------
-    # 10. Build output GeoDataFrame
+    # 11. Build output GeoDataFrame
     # ------------------------------------------------------------------
     s_rows = [rc[0] for rc in sampled_cells]
     s_cols = [rc[1] for rc in sampled_cells]
