@@ -113,3 +113,4 @@ MIN_DRAINAGE_AREA_M2 = 200000 if TEST_RUN else 1000000
 REFERENCE_CONCAVITY  = 0.45          # Reference concavity index (theta_ref)
 SMOOTHING_WINDOW     = 5             # Window size (cells) for gradient smoothing
 SAMPLE_DISTANCE      = 50            # Sample points every N meters along streams
+MIN_TRIBUTARY_LENGTH_M = 500         # Length (m) of minimum tributary length. Filters out short stream segments.
