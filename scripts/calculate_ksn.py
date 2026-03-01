@@ -192,11 +192,16 @@ def _filter_short_tributaries(
     """
     Remove sampled points on dangling tributary tips shorter than min_length_m.
 
-    A dangling tip is a headwater cell with no upstream neighbours. For each
-    tip we walk downstream until we reach a junction (a cell with 2+ upstream
-    neighbours) or the outlet, accumulating step count. If the tip-to-junction
-    distance is less than min_length_m, all sampled cells on that branch are
-    removed. The main stem and longer tributaries are always kept.
+    Headwaters are identified within the SAMPLED network only — a cell is a
+    sampled headwater if none of its upstream neighbours (per the full upstream
+    dict) are also in sampled_cells. This correctly handles the case where the
+    full stream mask has cells above every sampled point, meaning no cell appears
+    as a true headwater in the full upstream dict.
+
+    For each sampled headwater, we walk downstream through sampled_cells until
+    we reach a sampled junction (a cell with 2+ sampled upstream neighbours) or
+    the outlet. If the branch length in cells is below the threshold, all sampled
+    cells on that branch are removed.
     """
     if min_length_m <= 0:
         return sampled_cells
@@ -204,14 +209,21 @@ def _filter_short_tributaries(
     sampled_set = set(sampled_cells)
     min_steps   = max(1, int(min_length_m / cellsize))
 
-    # Build downstream index (inverse of upstream)
-    downstream = {}
-    for cell, ups in upstream.items():
-        for up in ups:
-            downstream[up] = cell
+    # Build sampled-only upstream: only keep upstream neighbours that are
+    # also in sampled_cells
+    sampled_upstream = {
+        c: [u for u in upstream.get(c, []) if u in sampled_set]
+        for c in sampled_set
+    }
 
-    # Headwaters: sampled cells with no upstream neighbours
-    headwaters = [c for c in sampled_set if not upstream.get(c)]
+    # Build sampled-only downstream index
+    sampled_downstream = {}
+    for cell, ups in sampled_upstream.items():
+        for up in ups:
+            sampled_downstream[up] = cell
+
+    # Headwaters in sampled network: no sampled upstream neighbours
+    headwaters = [c for c in sampled_set if not sampled_upstream.get(c)]
 
     cells_to_remove = set()
 
@@ -221,16 +233,14 @@ def _filter_short_tributaries(
         steps   = 0
 
         while True:
-            ds = downstream.get(current)
+            ds = sampled_downstream.get(current)
             if ds is None:
-                # Reached the outlet — this is the main stem, keep it
+                # Reached the outlet in sampled network — keep (main stem)
                 branch = []
                 break
             steps += 1
-            # Stop at a junction
-            if len(upstream.get(ds, [])) > 1:
-                break
-            if ds not in sampled_set:
+            # Stop at a sampled junction (2+ sampled upstream neighbours)
+            if len(sampled_upstream.get(ds, [])) > 1:
                 break
             branch.append(ds)
             current = ds
@@ -378,30 +388,6 @@ def extract_stream_points(
     # ------------------------------------------------------------------
     # 9. Remove dangling tributary tips shorter than MIN_TRIBUTARY_LENGTH_M
     # ------------------------------------------------------------------
-
-    # DIAGNOSTIC — remove after diagnosis
-    _downstream_debug = {}
-    for _cell, _ups in upstream.items():
-        for _up in _ups:
-            _downstream_debug[_up] = _cell
-    _headwaters_debug = [c for c in set(sampled_cells) if not upstream.get(c)]
-    logger.info(f"  PRE-FILTER headwater sampled cells: {len(_headwaters_debug)}")
-    for _tip in _headwaters_debug[:10]:
-        _current = _tip
-        _steps = 0
-        while True:
-            _ds = _downstream_debug.get(_current)
-            if _ds is None:
-                break
-            _steps += 1
-            if len(upstream.get(_ds, [])) > 1:
-                break
-            if _ds not in set(sampled_cells):
-                break
-            _current = _ds
-        logger.info(f"    tip={_tip} steps_to_junction={_steps} min_steps={int(MIN_TRIBUTARY_LENGTH_M / cellsize)}")
-    # END DIAGNOSTIC
-
     if MIN_TRIBUTARY_LENGTH_M > 0:
         before = len(sampled_cells)
         sampled_cells = _filter_short_tributaries(
