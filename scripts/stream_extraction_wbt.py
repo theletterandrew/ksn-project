@@ -401,7 +401,7 @@ def pixels_to_linestring(chain: list, transform) -> LineString:
 
 
 
-def build_directed_segment_graph(lines: list):
+def build_directed_segment_graph(lines: list, fac_arr: np.ndarray):
     """
     Build a *directed* node graph from (seg, LineString) pairs using the
     integer pixel coordinates from the raw pixel chains, not the floating-
@@ -412,11 +412,16 @@ def build_directed_segment_graph(lines: list):
     so each segment contributes one directed edge:
         mouth_pixel  -->  source_pixel
 
+    Outlet detection uses flow accumulation rather than topology alone.
+    For each weakly-connected component, the node whose mouth pixel has the
+    highest FAC value is the true outlet — this is robust even when streams
+    exit through the raster boundary (all clipped DEMs do this).
+
     Returns
     -------
     upstream   : {pixel: [(upstream_pixel, seg_index, length_m), ...]}
     downstream : {pixel: [(downstream_pixel, seg_index, length_m), ...]}
-    mouth_nodes: set of pixels that are true outlets (no downstream inflow)
+    mouth_nodes: one outlet pixel per connected component (highest FAC)
     """
     upstream   = defaultdict(list)
     downstream = defaultdict(list)
@@ -430,8 +435,46 @@ def build_directed_segment_graph(lines: list):
         downstream[source].append((mouth, i, length))
         all_nodes.update([mouth, source])
 
-    # True outlets: pixels nothing flows *into* from downstream
-    mouth_nodes = all_nodes - set(downstream.keys())
+    # Build undirected adjacency for connected-component detection
+    undirected = defaultdict(set)
+    for node, nbrs in upstream.items():
+        for nb, _, _ in nbrs:
+            undirected[node].add(nb)
+            undirected[nb].add(node)
+    for node in all_nodes:
+        if node not in undirected:
+            undirected[node] = set()
+
+    # Find connected components via BFS
+    visited    = set()
+    components = []
+    for start in all_nodes:
+        if start in visited:
+            continue
+        comp  = set()
+        queue = deque([start])
+        while queue:
+            n = queue.popleft()
+            if n in visited:
+                continue
+            visited.add(n)
+            comp.add(n)
+            queue.extend(undirected[n] - visited)
+        components.append(comp)
+
+    # For each component, pick the node with the highest FAC value as outlet.
+    # We look at every node that appears as a mouth end (seg[0]) of any segment
+    # within the component, since only mouth-end pixels can be outlets.
+    mouth_pixels_set = {seg[0] for seg, _ in lines}
+
+    mouth_nodes = set()
+    for comp in components:
+        candidates = comp & mouth_pixels_set
+        if not candidates:
+            # Fallback: any node in the component
+            candidates = comp
+        best = max(candidates, key=lambda p: float(fac_arr[p[0], p[1]]))
+        mouth_nodes.add(best)
 
     return dict(upstream), dict(downstream), mouth_nodes
 
@@ -471,6 +514,7 @@ def _longest_upstream_path(outlet, upstream_graph):
 
 def extract_longest_branch(
     lines: list,
+    fac_arr: np.ndarray,
     out_path: Path,
     out_crs,
     logger: logging.Logger,
@@ -498,23 +542,13 @@ def extract_longest_branch(
 
     logger.info("Step 7: Extracting longest mouth->headwater branch...")
 
-    upstream_graph, downstream_graph, mouth_nodes = build_directed_segment_graph(lines)
+    upstream_graph, downstream_graph, mouth_nodes = build_directed_segment_graph(lines, fac_arr)
 
     if not upstream_graph:
         logger.warning("  Segment graph is empty — skipping longest branch.")
         return
 
-    # If no clean outlet found (e.g. every node has a downstream neighbour
-    # because all outlets were filtered), fall back to the node with the
-    # lowest total upstream degree as a best-guess outlet.
-    if not mouth_nodes:
-        logger.warning(
-            "  No clean outlet node found — all segment endpoints have "
-            "downstream neighbours. Falling back to lowest-degree node."
-        )
-        mouth_nodes = {min(upstream_graph, key=lambda n: len(upstream_graph.get(n, [])))}
-
-    logger.info(f"  Outlet nodes found: {len(mouth_nodes)}")
+    logger.info(f"  Outlet nodes found (one per basin, by max FAC): {len(mouth_nodes)}")
 
     # Run longest-path DP from every outlet, keep the global best
     best_headwater = None
@@ -814,7 +848,11 @@ def main():
         # Step 7: Longest branch extraction (optional)
         # ------------------------------------------------------------------
         if EXTRACT_LONGEST_BRANCH:
-            extract_longest_branch(lines, out_longest_path, out_crs, logger)
+            # Re-read FAC for outlet detection (fac_data was freed after Step 1)
+            with rasterio.open(str(fac_path)) as _src:
+                fac_arr_full = _src.read(1).astype(np.float32)
+            extract_longest_branch(lines, fac_arr_full, out_longest_path, out_crs, logger)
+            del fac_arr_full
 
         elapsed = time.time() - start_time
         logger.info("=" * 60)
