@@ -401,58 +401,77 @@ def pixels_to_linestring(chain: list, transform) -> LineString:
 
 
 
-def build_segment_graph(lines: list) -> dict:
+def build_directed_segment_graph(lines: list):
     """
-    Build a node-level graph from (seg, LineString) pairs where nodes are
-    segment endpoints (rounded to 6 decimal places to handle float jitter)
-    and edges carry the segment index and its real-world length.
+    Build a *directed* node graph from (seg, LineString) pairs.
+
+    Segments are already ordered mouth->source (index 0 = downstream end),
+    so each segment contributes exactly one directed edge:
+        mouth_node  -->  source_node
 
     Returns
     -------
-    graph : {node: [(neighbour_node, seg_index, length_m), ...]}
-    seg_nodes : [(start_node, end_node), ...]  — endpoint pair per segment
+    upstream : {node: [(upstream_neighbour, seg_index, length_m), ...]}
+        Follow these edges to travel upstream (mouth -> headwater).
+    downstream : {node: [(downstream_neighbour, seg_index, length_m), ...]}
+        Follow these edges to travel downstream (headwater -> mouth).
+    mouth_nodes : set of nodes that have no incoming upstream edge —
+        i.e. true outlets (nothing drains into them from downstream).
     """
     def _pt(coord):
         return (round(coord[0], 4), round(coord[1], 4))
 
-    graph    = defaultdict(list)
-    seg_nodes = []
+    upstream   = defaultdict(list)   # node -> [(upstream_nb, idx, len), ...]
+    downstream = defaultdict(list)   # node -> [(downstream_nb, idx, len), ...]
+    all_nodes  = set()
 
     for i, (seg, line) in enumerate(lines):
         coords = list(line.coords)
-        a = _pt(coords[0])
-        b = _pt(coords[-1])
-        seg_nodes.append((a, b))
+        mouth  = _pt(coords[0])   # index 0 = downstream / mouth end
+        source = _pt(coords[-1])  # last   = upstream  / headwater end
         length = line.length
-        graph[a].append((b, i, length))
-        graph[b].append((a, i, length))
+        upstream[mouth].append((source, i, length))    # mouth -> source
+        downstream[source].append((mouth, i, length))  # source -> mouth
+        all_nodes.update([mouth, source])
 
-    return dict(graph), seg_nodes
+    # Outlet nodes: nodes that nothing flows *into* from downstream,
+    # i.e. they have no entry in downstream[] — they are the true mouths.
+    mouth_nodes = all_nodes - set(downstream.keys())
+
+    return dict(upstream), dict(downstream), mouth_nodes
 
 
-def _bfs_farthest(start, graph):
+def _longest_upstream_path(outlet, upstream_graph):
     """
-    BFS from *start*, returns (farthest_node, dist_dict, prev_dict).
-    dist_dict[node] = total length from start.
-    prev_dict[node] = (parent_node, seg_index) for path reconstruction.
+    Find the longest path from *outlet* to any headwater by traversing the
+    directed upstream graph.  Uses iterative DP (topological-order relaxation)
+    so it is exact for DAGs (which a D8 stream network always is).
+
+    Returns
+    -------
+    best_headwater : the node at the far end of the longest path
+    dist           : {node: longest distance from outlet to that node}
+    prev           : {node: (parent_node, seg_index)} for path reconstruction
     """
-    dist = {start: 0.0}
-    prev = {start: None}
-    queue = deque([start])
-    farthest, max_dist = start, 0.0
+    # Iterative BFS/DP: process nodes in upstream order (BFS layers from outlet)
+    dist = {outlet: 0.0}
+    prev = {outlet: None}
+    queue = deque([outlet])
+    best_headwater, max_dist = outlet, 0.0
 
     while queue:
         node = queue.popleft()
-        for nb, seg_idx, length in graph.get(node, []):
-            if nb not in dist:
-                dist[nb] = dist[node] + length
+        for nb, seg_idx, length in upstream_graph.get(node, []):
+            new_dist = dist[node] + length
+            if nb not in dist or new_dist > dist[nb]:
+                dist[nb] = new_dist
                 prev[nb] = (node, seg_idx)
                 queue.append(nb)
-                if dist[nb] > max_dist:
-                    max_dist = dist[nb]
-                    farthest = nb
+                if new_dist > max_dist:
+                    max_dist = new_dist
+                    best_headwater = nb
 
-    return farthest, dist, prev
+    return best_headwater, dist, prev
 
 
 def extract_longest_branch(
@@ -462,20 +481,21 @@ def extract_longest_branch(
     logger: logging.Logger,
 ) -> None:
     """
-    Find the longest simple path through the segment network (mouth to
-    most-distant headwater) using double-BFS on the endpoint graph, then
-    write those segments in order to *out_path* as a GeoPackage.
+    Find the longest flow-direction-coherent path (outlet -> headwater)
+    in the stream network and write those segments to *out_path*.
 
-    The algorithm is exact for trees (acyclic networks) and gives a good
-    approximation for networks with cycles.
+    Unlike the previous double-BFS approach, this uses a *directed* graph
+    so the path can never cross a junction — it only ever travels upstream
+    along one tributary at each confluence, matching true stream topology.
 
-    Steps
-    -----
-    1. Build a node graph where each node is a segment endpoint and each
-       edge is a segment with its real-world length.
-    2. BFS from an arbitrary node to find one end of the diameter (A).
-    3. BFS from A to find the other end (B) and record the full distance.
-    4. Reconstruct the segment path A->B and write to GeoPackage.
+    Algorithm
+    ---------
+    1. Build a directed graph: edges point mouth -> source (upstream).
+    2. Identify outlet node(s): nodes with no downstream neighbours
+       (nothing drains into them).
+    3. For each outlet run a longest-path DP upstream (exact on DAGs).
+    4. Keep the globally longest path across all outlets.
+    5. Reconstruct and write the ordered segment list.
     """
     if not lines:
         logger.warning("  No segments available for longest-branch extraction.")
@@ -483,43 +503,64 @@ def extract_longest_branch(
 
     logger.info("Step 7: Extracting longest mouth->headwater branch...")
 
-    graph, seg_nodes = build_segment_graph(lines)
-    all_nodes = list(graph.keys())
+    upstream_graph, downstream_graph, mouth_nodes = build_directed_segment_graph(lines)
 
-    if not all_nodes:
+    if not upstream_graph:
         logger.warning("  Segment graph is empty — skipping longest branch.")
         return
 
-    # Double-BFS diameter algorithm
-    # Pass 1: find far end A from an arbitrary start
-    arbitrary = all_nodes[0]
-    node_a, _, _ = _bfs_farthest(arbitrary, graph)
+    # If no clean outlet found (e.g. every node has a downstream neighbour
+    # because all outlets were filtered), fall back to the node with the
+    # lowest total upstream degree as a best-guess outlet.
+    if not mouth_nodes:
+        logger.warning(
+            "  No clean outlet node found — all segment endpoints have "
+            "downstream neighbours. Falling back to lowest-degree node."
+        )
+        mouth_nodes = {min(upstream_graph, key=lambda n: len(upstream_graph.get(n, [])))}
 
-    # Pass 2: find far end B from A — this is the true diameter path
-    node_b, dist_from_a, prev_from_a = _bfs_farthest(node_a, graph)
+    logger.info(f"  Outlet nodes found: {len(mouth_nodes)}")
 
-    total_length_m = dist_from_a[node_b]
-    logger.info(f"  Longest path: {total_length_m:.1f} m  ({total_length_m/1000:.2f} km)")
+    # Run longest-path DP from every outlet, keep the global best
+    best_headwater = None
+    best_dist      = {}
+    best_prev      = {}
+    best_outlet    = None
+    best_length    = 0.0
 
-    # Reconstruct segment indices along the path B -> A
+    for outlet in mouth_nodes:
+        headwater, dist, prev = _longest_upstream_path(outlet, upstream_graph)
+        path_length = dist.get(headwater, 0.0)
+        if path_length > best_length:
+            best_length    = path_length
+            best_headwater = headwater
+            best_dist      = dist
+            best_prev      = prev
+            best_outlet    = outlet
+
+    logger.info(
+        f"  Longest path: {best_length:.1f} m  ({best_length / 1000:.2f} km)"
+        f"  |  outlet -> headwater"
+    )
+
+    # Reconstruct segment indices: walk prev[] from headwater back to outlet
     path_seg_indices = []
-    cursor = node_b
-    while prev_from_a[cursor] is not None:
-        parent, seg_idx = prev_from_a[cursor]
+    cursor = best_headwater
+    while best_prev.get(cursor) is not None:
+        parent, seg_idx = best_prev[cursor]
         path_seg_indices.append(seg_idx)
         cursor = parent
-    path_seg_indices.reverse()   # now runs A -> B (mouth -> headwater)
+    path_seg_indices.reverse()   # now ordered outlet -> headwater
 
     logger.info(f"  Path segments: {len(path_seg_indices)}")
 
-    # Write output
     schema = {
         "geometry": "LineString",
         "properties": {
-            "seg_id":       "int",
-            "order_along":  "int",   # 1 = most downstream
-            "length_m":     "float",
-            "n_vertices":   "int",
+            "seg_id":      "int",
+            "order_along": "int",    # 1 = most downstream
+            "length_m":    "float",
+            "n_vertices":  "int",
         },
     }
 
