@@ -193,16 +193,13 @@ def _filter_short_tributaries(
     """
     Remove sampled points on dangling tributary tips shorter than min_length_m.
 
-    Headwaters are identified within the SAMPLED network only — a cell is a
-    sampled headwater if none of its upstream neighbours are also in sampled_cells.
-    This handles the case where the full stream mask has cells above every sampled
-    point (so nothing appears as a headwater in the full upstream dict).
-
-    For each sampled headwater we walk downstream through sampled_cells until we
-    reach a sampled junction (2+ sampled upstream neighbours) or the end of the
-    sampled network. The branch is removed if:
-      - its length is below min_length_m, AND
-      - it does not terminate at outlet_rc (which would mean it IS the main stem)
+    Headwaters are identified within the SAMPLED network only. For each sampled
+    headwater we walk downstream until we reach a junction or the network end,
+    measuring branch length in steps. A branch is removed only if:
+      1. Its length is below min_length_m, AND
+      2. It is not the longest branch in the network (so we never empty a
+         watershed whose entire network is shorter than the threshold), AND
+      3. It does not terminate at outlet_rc (main stem protection).
     """
     if min_length_m <= 0:
         return sampled_cells
@@ -223,30 +220,37 @@ def _filter_short_tributaries(
     # Headwaters in sampled network: no sampled upstream neighbours
     headwaters = [c for c in sampled_set if not sampled_upstream.get(c)]
 
-    cells_to_remove = set()
-
+    # First pass: measure all branch lengths
+    branches = []  # list of (tip, branch_cells, steps, is_main_stem)
     for tip in headwaters:
         branch  = [tip]
         current = tip
         steps   = 0
+        is_main = False
 
         while True:
             ds = sampled_downstream.get(current)
             if ds is None:
-                # End of sampled network reached.
-                # If current IS the outlet this branch is the main stem — keep.
-                # Otherwise it's an orphaned stub with no downstream — remove.
                 if current == outlet_rc:
-                    branch = []
+                    is_main = True
                 break
             steps += 1
             if len(sampled_upstream.get(ds, [])) > 1:
-                # Reached a sampled junction — stop here
                 break
             branch.append(ds)
             current = ds
 
-        if branch and steps < min_steps:
+        branches.append((tip, branch, steps, is_main))
+
+    # Find the longest branch length so we never remove all branches
+    max_steps = max((steps for _, _, steps, _ in branches), default=0)
+
+    # Second pass: remove short non-main-stem branches that aren't the longest
+    cells_to_remove = set()
+    for tip, branch, steps, is_main in branches:
+        if is_main:
+            continue
+        if steps < min_steps and steps < max_steps:
             cells_to_remove.update(branch)
 
     return [c for c in sampled_cells if c not in cells_to_remove]
@@ -399,28 +403,6 @@ def extract_stream_points(
                 f"  Dropped {dropped_tribs} points on short tributaries "
                 f"(< {MIN_TRIBUTARY_LENGTH_M:.0f} m)"
             )
-    # DIAGNOSTIC
-    headwaters_debug = [c for c in set(sampled_cells) if not upstream.get(c)]
-    logger.info(f"  Headwater sampled cells: {len(headwaters_debug)}")
-    for tip in headwaters_debug[:5]:
-        downstream_debug = {}
-        for cell, ups in upstream.items():
-            for up in ups:
-                downstream_debug[up] = cell
-        current = tip
-        steps = 0
-        while True:
-            ds = downstream_debug.get(current)
-            if ds is None:
-                break
-            steps += 1
-            if len(upstream.get(ds, [])) > 1:
-                break
-            if ds not in set(sampled_cells):
-                break
-            current = ds
-        logger.info(f"    tip={tip} steps_to_junction={steps} min_steps={int(MIN_TRIBUTARY_LENGTH_M / cellsize)}")
-    # END DIAGNOSTIC
     
     if not sampled_cells:
         logger.warning("  All points removed by tributary length filter")
