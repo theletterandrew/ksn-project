@@ -79,6 +79,9 @@ MAX_WORKERS = 4
 # Stream threshold (in pixels)
 MIN_DRAINAGE_AREA_CELLS = 900000 if TEST_RUN else 10000000    # cells (~4 km² at 2m resolution)
 
+# Length (m) of minimum tributary length. Filters out short stream segments.
+MIN_TRIBUTARY_LENGTH_M = 500         
+
 # Number of border cells to blank on all four edges before thresholding.
 # Edge cells drain off-raster in D8, accumulating spurious flow.
 BORDER_CELLS = 3
@@ -113,4 +116,3 @@ MIN_DRAINAGE_AREA_M2 = 200000 if TEST_RUN else 1000000
 REFERENCE_CONCAVITY  = 0.45          # Reference concavity index (theta_ref)
 SMOOTHING_WINDOW     = 5             # Window size (cells) for gradient smoothing
 SAMPLE_DISTANCE      = 50            # Sample points every N meters along streams
-MIN_TRIBUTARY_LENGTH_M = 500         # Length (m) of minimum tributary length. Filters out short stream segments.
