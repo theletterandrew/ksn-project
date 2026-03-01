@@ -735,22 +735,46 @@ def main():
         if out_path.exists():
             out_path.unlink()
 
-        # Convert all segments to LineStrings and apply length filter
+        # Convert all segments to LineStrings
         lines = []
         for seg in segments:
             line = pixels_to_linestring(seg, transform)
             if line.length > 0:
                 lines.append((seg, line))
 
-        before_len = len(lines)
+        # Apply length filter — but ONLY to headwater stubs (segments whose
+        # upstream end has no further upstream neighbours).  Connector segments
+        # that link two other segments must never be dropped regardless of
+        # length, otherwise the network fragments into disconnected pieces and
+        # the longest-branch graph loses its outlet nodes.
         if MIN_STREAM_LENGTH_M > 0:
-            lines = [(seg, line) for seg, line in lines if line.length >= MIN_STREAM_LENGTH_M]
-            dropped_len = before_len - len(lines)
-            if dropped_len:
+            # Build a set of all pixels that appear as the MOUTH end of any
+            # segment — i.e. pixels something drains into.  A segment whose
+            # SOURCE end (seg[-1]) does NOT appear as a mouth end of another
+            # segment is a true headwater stub; only those are length-filtered.
+            mouth_pixels = {seg[0] for seg, _ in lines}
+
+            kept, dropped_stub, protected = [], 0, 0
+            for seg, line in lines:
+                is_headwater_stub = seg[-1] not in mouth_pixels
+                if is_headwater_stub and line.length < MIN_STREAM_LENGTH_M:
+                    dropped_stub += 1
+                else:
+                    if not is_headwater_stub and line.length < MIN_STREAM_LENGTH_M:
+                        protected += 1
+                    kept.append((seg, line))
+
+            if dropped_stub:
                 logger.info(
-                    f"  Removed {dropped_len:,} segments shorter than "
-                    f"{MIN_STREAM_LENGTH_M} m (kept {len(lines):,})"
+                    f"  Removed {dropped_stub:,} headwater stubs shorter than "
+                    f"{MIN_STREAM_LENGTH_M} m (kept {len(kept):,})"
                 )
+            if protected:
+                logger.info(
+                    f"  Protected {protected:,} short connector segments "
+                    f"from length filter (topology preserved)"
+                )
+            lines = kept
 
         if not lines:
             logger.error(
