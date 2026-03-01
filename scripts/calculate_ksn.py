@@ -389,7 +389,29 @@ def extract_stream_points(
                 f"  Dropped {dropped_tribs} points on short tributaries "
                 f"(< {MIN_TRIBUTARY_LENGTH_M:.0f} m)"
             )
-
+    # DIAGNOSTIC
+    headwaters_debug = [c for c in set(sampled_cells) if not upstream.get(c)]
+    logger.info(f"  Headwater sampled cells: {len(headwaters_debug)}")
+    for tip in headwaters_debug[:5]:
+        downstream_debug = {}
+        for cell, ups in upstream.items():
+            for up in ups:
+                downstream_debug[up] = cell
+        current = tip
+        steps = 0
+        while True:
+            ds = downstream_debug.get(current)
+            if ds is None:
+                break
+            steps += 1
+            if len(upstream.get(ds, [])) > 1:
+                break
+            if ds not in set(sampled_cells):
+                break
+            current = ds
+        logger.info(f"    tip={tip} steps_to_junction={steps} min_steps={int(MIN_TRIBUTARY_LENGTH_M / cellsize)}")
+    # END DIAGNOSTIC
+    
     if not sampled_cells:
         logger.warning("  All points removed by tributary length filter")
         return None
