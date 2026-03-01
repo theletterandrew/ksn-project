@@ -258,54 +258,18 @@ def extract_stream_points(
 
     stream_mask = (area_m2 >= min_area_m2) & dem_valid
 
-    # ------------------------------------------------------------------
-    # 5. Blank stream_mask edges that touch the full mosaic boundary.
-    #
-    #    WBT D8 routing accumulates spurious flow along the outermost
-    #    rows/cols of the mosaic, producing a false high-accumulation
-    #    line at the raster edge. We detect which edges of this clipped
-    #    watershed actually touch the mosaic boundary by comparing
-    #    geographic coordinates, then blank only those edges.
-    #    This is more reliable than FDR=0 detection because a watershed
-    #    whose trunk channel runs near the mosaic edge will have valid
-    #    FDR values right up to the boundary.
-    # ------------------------------------------------------------------
-    try:
-        with rasterio.open(str(DEM_MOSAIC)) as mosaic_src:
-            mb = mosaic_src.bounds
-        ws_bounds = rasterio.transform.array_bounds(
-            dem.shape[0], dem.shape[1], transform
-        )
-        tol = cellsize * 0.5
-        b   = 3
-        # ws_bounds order: (left, bottom, right, top)
-        if abs(ws_bounds[1] - mb.bottom) < tol:
-            stream_mask[-b:, :] = False
-            logger.info("  Blanked bottom edge (mosaic boundary)")
-        if abs(ws_bounds[3] - mb.top) < tol:
-            stream_mask[:b,  :] = False
-            logger.info("  Blanked top edge (mosaic boundary)")
-        if abs(ws_bounds[0] - mb.left) < tol:
-            stream_mask[:,  :b] = False
-            logger.info("  Blanked left edge (mosaic boundary)")
-        if abs(ws_bounds[2] - mb.right) < tol:
-            stream_mask[:, -b:] = False
-            logger.info("  Blanked right edge (mosaic boundary)")
-    except Exception as e:
-        logger.warning(f"  Could not check mosaic bounds for edge blanking: {e}")
-
     if not stream_mask.any():
         logger.warning("  No stream cells above threshold")
         return None
 
     # ------------------------------------------------------------------
-    # 6. Compute slope with nodata-aware smoothing
+    # 5. Compute slope with nodata-aware smoothing
     # ------------------------------------------------------------------
     logger.info("  Computing slope...")
     slope = calculate_gradient_smoothed(dem, nodata, cellsize, window_size)
 
     # ------------------------------------------------------------------
-    # 7. Compute ksn = slope * area^theta
+    # 6. Compute ksn = slope * area^theta
     # ------------------------------------------------------------------
     logger.info("  Computing ksn...")
     area_safe = np.maximum(area_m2, 1.0)
@@ -313,7 +277,7 @@ def extract_stream_points(
     ksn = np.where(np.isfinite(ksn), ksn, 0.0)
 
     # ------------------------------------------------------------------
-    # 8. Filter invalid pixels before sampling
+    # 7. Filter invalid pixels before sampling
     # ------------------------------------------------------------------
     stream_rows, stream_cols = np.where(stream_mask)
     valid = (
@@ -333,7 +297,7 @@ def extract_stream_points(
     valid_stream_mask[stream_rows, stream_cols] = True
 
     # ------------------------------------------------------------------
-    # 9. Sample along D8 flow paths (outlet -> headwater)
+    # 8. Sample along D8 flow paths (outlet -> headwater)
     # ------------------------------------------------------------------
     logger.info("  Tracing channel paths for ordered sampling...")
     upstream = _build_upstream_index(fdr_raw, fdr_nodata, valid_stream_mask)
@@ -351,6 +315,40 @@ def extract_stream_points(
         return None
 
     logger.info(f"  {len(sampled_cells)} sample points along channel paths")
+
+    # ------------------------------------------------------------------
+    # 9. Remove points that fall within 3 cells of the mosaic boundary.
+    #
+    #    WBT D8 routing produces spurious high-accumulation values along
+    #    the outermost rows/cols of the mosaic. Rather than blanking the
+    #    stream_mask before tracing (which kills watershed_4's outlet),
+    #    we let the BFS run freely and then drop any sampled point whose
+    #    geographic coordinates fall within BORDER_CELLS of the mosaic edge.
+    # ------------------------------------------------------------------
+    try:
+        with rasterio.open(str(DEM_MOSAIC)) as mosaic_src:
+            mb       = mosaic_src.bounds
+            border_m = 3 * mosaic_src.res[0]   # 3 cells in map units
+
+        before = len(sampled_cells)
+        sampled_cells = [
+            (r, c) for r, c in sampled_cells
+            if not (
+                rasterio.transform.xy(transform, r, c)[0] <= mb.left   + border_m or
+                rasterio.transform.xy(transform, r, c)[0] >= mb.right  - border_m or
+                rasterio.transform.xy(transform, r, c)[1] <= mb.bottom + border_m or
+                rasterio.transform.xy(transform, r, c)[1] >= mb.top    - border_m
+            )
+        ]
+        dropped = before - len(sampled_cells)
+        if dropped:
+            logger.info(f"  Dropped {dropped} points within {3}-cell mosaic border")
+    except Exception as e:
+        logger.warning(f"  Could not filter mosaic border points: {e}")
+
+    if not sampled_cells:
+        logger.warning("  All points were within mosaic border — skipping")
+        return None
 
     # ------------------------------------------------------------------
     # 10. Build output GeoDataFrame
