@@ -188,20 +188,21 @@ def _filter_short_tributaries(
     upstream: dict,
     cellsize: float,
     min_length_m: float,
+    outlet_rc: tuple,
 ) -> list:
     """
     Remove sampled points on dangling tributary tips shorter than min_length_m.
 
     Headwaters are identified within the SAMPLED network only — a cell is a
-    sampled headwater if none of its upstream neighbours (per the full upstream
-    dict) are also in sampled_cells. This correctly handles the case where the
-    full stream mask has cells above every sampled point, meaning no cell appears
-    as a true headwater in the full upstream dict.
+    sampled headwater if none of its upstream neighbours are also in sampled_cells.
+    This handles the case where the full stream mask has cells above every sampled
+    point (so nothing appears as a headwater in the full upstream dict).
 
-    For each sampled headwater, we walk downstream through sampled_cells until
-    we reach a sampled junction (a cell with 2+ sampled upstream neighbours) or
-    the outlet. If the branch length in cells is below the threshold, all sampled
-    cells on that branch are removed.
+    For each sampled headwater we walk downstream through sampled_cells until we
+    reach a sampled junction (2+ sampled upstream neighbours) or the end of the
+    sampled network. The branch is removed if:
+      - its length is below min_length_m, AND
+      - it does not terminate at outlet_rc (which would mean it IS the main stem)
     """
     if min_length_m <= 0:
         return sampled_cells
@@ -209,14 +210,11 @@ def _filter_short_tributaries(
     sampled_set = set(sampled_cells)
     min_steps   = max(1, int(min_length_m / cellsize))
 
-    # Build sampled-only upstream: only keep upstream neighbours that are
-    # also in sampled_cells
+    # Build sampled-only upstream and downstream indices
     sampled_upstream = {
         c: [u for u in upstream.get(c, []) if u in sampled_set]
         for c in sampled_set
     }
-
-    # Build sampled-only downstream index
     sampled_downstream = {}
     for cell, ups in sampled_upstream.items():
         for up in ups:
@@ -235,12 +233,15 @@ def _filter_short_tributaries(
         while True:
             ds = sampled_downstream.get(current)
             if ds is None:
-                # Reached the outlet in sampled network — keep (main stem)
-                branch = []
+                # End of sampled network reached.
+                # If current IS the outlet this branch is the main stem — keep.
+                # Otherwise it's an orphaned stub with no downstream — remove.
+                if current == outlet_rc:
+                    branch = []
                 break
             steps += 1
-            # Stop at a sampled junction (2+ sampled upstream neighbours)
             if len(sampled_upstream.get(ds, [])) > 1:
+                # Reached a sampled junction — stop here
                 break
             branch.append(ds)
             current = ds
@@ -249,7 +250,6 @@ def _filter_short_tributaries(
             cells_to_remove.update(branch)
 
     return [c for c in sampled_cells if c not in cells_to_remove]
-
 
 def extract_stream_points(
     dem_path: Path,
@@ -391,7 +391,7 @@ def extract_stream_points(
     if MIN_TRIBUTARY_LENGTH_M > 0:
         before = len(sampled_cells)
         sampled_cells = _filter_short_tributaries(
-            sampled_cells, upstream, cellsize, MIN_TRIBUTARY_LENGTH_M
+            sampled_cells, upstream, cellsize, MIN_TRIBUTARY_LENGTH_M, outlet_rc
         )
         dropped_tribs = before - len(sampled_cells)
         if dropped_tribs:
@@ -399,6 +399,28 @@ def extract_stream_points(
                 f"  Dropped {dropped_tribs} points on short tributaries "
                 f"(< {MIN_TRIBUTARY_LENGTH_M:.0f} m)"
             )
+    # DIAGNOSTIC
+    headwaters_debug = [c for c in set(sampled_cells) if not upstream.get(c)]
+    logger.info(f"  Headwater sampled cells: {len(headwaters_debug)}")
+    for tip in headwaters_debug[:5]:
+        downstream_debug = {}
+        for cell, ups in upstream.items():
+            for up in ups:
+                downstream_debug[up] = cell
+        current = tip
+        steps = 0
+        while True:
+            ds = downstream_debug.get(current)
+            if ds is None:
+                break
+            steps += 1
+            if len(upstream.get(ds, [])) > 1:
+                break
+            if ds not in set(sampled_cells):
+                break
+            current = ds
+        logger.info(f"    tip={tip} steps_to_junction={steps} min_steps={int(MIN_TRIBUTARY_LENGTH_M / cellsize)}")
+    # END DIAGNOSTIC
     
     if not sampled_cells:
         logger.warning("  All points removed by tributary length filter")
