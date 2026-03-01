@@ -192,8 +192,14 @@ def trace_segments(adj: dict) -> list:
 
         while True:
             nbrs = [n for n in adj.get(curr, []) if n != prev]
-            # Stop at junction, dead-end, or already-visited node
-            if not nbrs or curr in junctions:
+            # Stop at a junction — but include the junction pixel itself so
+            # adjacent segments share the same endpoint coordinate and the
+            # network is topologically connected (no 1-pixel gaps at nodes).
+            if curr in junctions:
+                chain.append(curr)
+                break
+            # Stop at dead-end or already-visited fork
+            if not nbrs:
                 break
             if len(nbrs) == 1:
                 nxt = nbrs[0]
@@ -204,6 +210,8 @@ def trace_segments(adj: dict) -> list:
                 chain.append(nxt)
                 prev, curr = curr, nxt
             else:
+                # len(nbrs) > 1 but curr not classified as junction —
+                # shouldn't happen post-skeletonization, but stop safely.
                 break
         return chain
 
