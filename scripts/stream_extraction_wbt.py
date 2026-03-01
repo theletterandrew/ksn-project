@@ -556,9 +556,10 @@ def main():
 
     logger = setup_logging(output_dir)
 
-    fac_path = wbt_dir / FAC_FILE
-    fdr_path = wbt_dir / FDR_FILE
-    out_path = output_dir / OUTPUT_FILE
+    fac_path         = wbt_dir    / FAC_FILE
+    fdr_path         = wbt_dir    / FDR_FILE
+    out_path         = output_dir / OUTPUT_FILE
+    out_longest_path = output_dir / LONGEST_BRANCH_FILE
 
     for label, p in [("FAC", fac_path), ("FDR", fdr_path)]:
         if not p.exists():
