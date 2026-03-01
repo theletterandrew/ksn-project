@@ -240,7 +240,11 @@ def trace_segments(adj: dict) -> list:
             curr = nxt[0] if nxt else None
         segments.append(loop)
         remaining -= set(loop)
-
+    # DEBUG: log first 10 segment start/end pixels and lengths
+    import logging
+    log = logging.getLogger(__name__)
+    for i, seg in enumerate(segments[:10]):
+        log.info(f"  seg[{i}]: len={len(seg)}  head={seg[0]}  tail={seg[-1]}")
     return segments
 
 
@@ -391,6 +395,10 @@ def main():
         # ------------------------------------------------------------------
         logger.info("Step 4: Tracing skeleton into line segments...")
         adj      = build_adjacency(skeleton)
+        junction_nodes = {n for n, nbrs in adj.items() if len(nbrs) >= 3}
+        sample = list(junction_nodes)[:3]
+        for jn in sample:
+            logger.info(f"  Junction {jn}: neighbors = {adj[jn]}")
         segments = trace_segments(adj)
         # DEBUG
         junction_count = sum(1 for n, nbrs in adj.items() if len(nbrs) >= 3)
