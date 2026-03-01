@@ -12,10 +12,11 @@ Pipeline:
   3. Trace each centreline pixel-chain into a LineString, ordered
      mouth->source using the FDR raster so downstream ends are always
      at index 0
-  4. Merge collinear segments at junctions using a graph (networkx)
-     so the output is a clean, connected network rather than a pile
-     of 1-2 pixel fragments
-  5. Write the final LineStrings to a GeoPackage
+  4. Collapse junction-pixel clusters from skeletonization artifacts
+     so every branch point is a single node
+  5. Write the full network to streams_connected.gpkg
+  6. Optionally extract the longest outlet-to-headwater path and write
+     it to streams_longest_branch.gpkg (set EXTRACT_LONGEST_BRANCH=True)
 
 USAGE:
     1. Install dependencies:
@@ -89,6 +90,12 @@ MIN_STREAM_LENGTH_M = config.MIN_STREAM_LENGTH_M
 # flow, creating false streams along the DEM boundary.
 # At 2 m resolution, 3 cells = 6 m. Increase to 5-10 if artifacts persist.
 BORDER_CELLS = config.BORDER_CELLS
+
+# Extract the longest continuous mouth->headwater path from the network and
+# save it as a separate GeoPackage.  Useful for ksn profile extraction along
+# the main stem.  Uses a double-BFS on the segment graph so it runs in O(N).
+EXTRACT_LONGEST_BRANCH = getattr(config, "EXTRACT_LONGEST_BRANCH", True)
+LONGEST_BRANCH_FILE    = "streams_longest_branch.gpkg"
 
 # =============================================================================
 # END CONFIG — No edits needed below this line
@@ -393,6 +400,155 @@ def pixels_to_linestring(chain: list, transform) -> LineString:
     return LineString(coords)
 
 
+
+def build_segment_graph(lines: list) -> dict:
+    """
+    Build a node-level graph from (seg, LineString) pairs where nodes are
+    segment endpoints (rounded to 6 decimal places to handle float jitter)
+    and edges carry the segment index and its real-world length.
+
+    Returns
+    -------
+    graph : {node: [(neighbour_node, seg_index, length_m), ...]}
+    seg_nodes : [(start_node, end_node), ...]  — endpoint pair per segment
+    """
+    def _pt(coord):
+        return (round(coord[0], 4), round(coord[1], 4))
+
+    graph    = defaultdict(list)
+    seg_nodes = []
+
+    for i, (seg, line) in enumerate(lines):
+        coords = list(line.coords)
+        a = _pt(coords[0])
+        b = _pt(coords[-1])
+        seg_nodes.append((a, b))
+        length = line.length
+        graph[a].append((b, i, length))
+        graph[b].append((a, i, length))
+
+    return dict(graph), seg_nodes
+
+
+def _bfs_farthest(start, graph):
+    """
+    BFS from *start*, returns (farthest_node, dist_dict, prev_dict).
+    dist_dict[node] = total length from start.
+    prev_dict[node] = (parent_node, seg_index) for path reconstruction.
+    """
+    dist = {start: 0.0}
+    prev = {start: None}
+    queue = deque([start])
+    farthest, max_dist = start, 0.0
+
+    while queue:
+        node = queue.popleft()
+        for nb, seg_idx, length in graph.get(node, []):
+            if nb not in dist:
+                dist[nb] = dist[node] + length
+                prev[nb] = (node, seg_idx)
+                queue.append(nb)
+                if dist[nb] > max_dist:
+                    max_dist = dist[nb]
+                    farthest = nb
+
+    return farthest, dist, prev
+
+
+def extract_longest_branch(
+    lines: list,
+    out_path: Path,
+    out_crs,
+    logger: logging.Logger,
+) -> None:
+    """
+    Find the longest simple path through the segment network (mouth to
+    most-distant headwater) using double-BFS on the endpoint graph, then
+    write those segments in order to *out_path* as a GeoPackage.
+
+    The algorithm is exact for trees (acyclic networks) and gives a good
+    approximation for networks with cycles.
+
+    Steps
+    -----
+    1. Build a node graph where each node is a segment endpoint and each
+       edge is a segment with its real-world length.
+    2. BFS from an arbitrary node to find one end of the diameter (A).
+    3. BFS from A to find the other end (B) and record the full distance.
+    4. Reconstruct the segment path A->B and write to GeoPackage.
+    """
+    if not lines:
+        logger.warning("  No segments available for longest-branch extraction.")
+        return
+
+    logger.info("Step 7: Extracting longest mouth->headwater branch...")
+
+    graph, seg_nodes = build_segment_graph(lines)
+    all_nodes = list(graph.keys())
+
+    if not all_nodes:
+        logger.warning("  Segment graph is empty — skipping longest branch.")
+        return
+
+    # Double-BFS diameter algorithm
+    # Pass 1: find far end A from an arbitrary start
+    arbitrary = all_nodes[0]
+    node_a, _, _ = _bfs_farthest(arbitrary, graph)
+
+    # Pass 2: find far end B from A — this is the true diameter path
+    node_b, dist_from_a, prev_from_a = _bfs_farthest(node_a, graph)
+
+    total_length_m = dist_from_a[node_b]
+    logger.info(f"  Longest path: {total_length_m:.1f} m  ({total_length_m/1000:.2f} km)")
+
+    # Reconstruct segment indices along the path B -> A
+    path_seg_indices = []
+    cursor = node_b
+    while prev_from_a[cursor] is not None:
+        parent, seg_idx = prev_from_a[cursor]
+        path_seg_indices.append(seg_idx)
+        cursor = parent
+    path_seg_indices.reverse()   # now runs A -> B (mouth -> headwater)
+
+    logger.info(f"  Path segments: {len(path_seg_indices)}")
+
+    # Write output
+    schema = {
+        "geometry": "LineString",
+        "properties": {
+            "seg_id":       "int",
+            "order_along":  "int",   # 1 = most downstream
+            "length_m":     "float",
+            "n_vertices":   "int",
+        },
+    }
+
+    if out_path.exists():
+        out_path.unlink()
+
+    with fiona.open(
+        str(out_path),
+        mode="w",
+        driver="GPKG",
+        schema=schema,
+        crs=out_crs,
+        layer="longest_branch",
+    ) as dst:
+        for order, idx in enumerate(path_seg_indices, start=1):
+            seg, line = lines[idx]
+            dst.write({
+                "geometry": mapping(line),
+                "properties": {
+                    "seg_id":      idx + 1,
+                    "order_along": order,
+                    "length_m":    round(line.length, 2),
+                    "n_vertices":  len(seg),
+                },
+            })
+
+    logger.info(f"  Written to: {out_path}")
+
+
 def main():
     wbt_dir    = Path(WBT_DIR)
     output_dir = Path(OUTPUT_DIR)
@@ -592,14 +748,22 @@ def main():
             if batch:
                 dst.writerecords(batch)
 
+        # ------------------------------------------------------------------
+        # Step 7: Longest branch extraction (optional)
+        # ------------------------------------------------------------------
+        if EXTRACT_LONGEST_BRANCH:
+            extract_longest_branch(lines, out_longest_path, out_crs, logger)
+
         elapsed = time.time() - start_time
         logger.info("=" * 60)
         logger.info("COMPLETE")
-        logger.info(f"  Output    : {out_path}")
+        logger.info(f"  Network   : {out_path}")
         logger.info(f"  Segments  : {count:,}")
+        if EXTRACT_LONGEST_BRANCH:
+            logger.info(f"  Longest   : {out_longest_path}")
         logger.info(f"  Total time: {elapsed / 60:.1f} minutes")
         logger.info("")
-        logger.info("Load streams_connected.gpkg in QGIS or ArcGIS Pro to verify.")
+        logger.info("Load the .gpkg files in QGIS or ArcGIS Pro to verify.")
         logger.info("Each feature is a LineString ordered mouth->source.")
 
     except Exception as e:
