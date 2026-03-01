@@ -303,6 +303,23 @@ def extract_stream_points(
     outlet_idx    = int(np.argmax(fac_at_stream))
     outlet_rc     = (int(stream_rows[outlet_idx]), int(stream_cols[outlet_idx]))
 
+    # DIAGNOSTIC — remove after diagnosis
+    out_r, out_c = outlet_rc
+    logger.info(f"  Outlet cell: r={out_r} c={out_c}  FAC={area_m2[out_r, out_c]:.0f}")
+    logger.info(f"  DEM shape: {dem.shape}  on_edge: r={out_r==0 or out_r==dem.shape[0]-1}  c={out_c==0 or out_c==dem.shape[1]-1}")
+    logger.info(f"  FDR at outlet: {fdr_raw[out_r, out_c]}  fdr_nodata={fdr_nodata}")
+    _D8 = {(0,1):1,(1,1):2,(1,0):4,(1,-1):8,(0,-1):16,(-1,-1):32,(-1,0):64,(-1,1):128}
+    _UP = {(dr,dc): _D8[(-dr,-dc)] for (dr,dc) in _D8 if (-dr,-dc) in _D8}
+    _ups = []
+    for (dr,dc), exp in _UP.items():
+        nr, nc = out_r+dr, out_c+dc
+        if 0<=nr<dem.shape[0] and 0<=nc<dem.shape[1] and valid_stream_mask[nr,nc]:
+            if int(fdr_raw[nr,nc]) == exp:
+                _ups.append((nr, nc, int(fdr_raw[nr,nc])))
+    logger.info(f"  Upstream neighbours of outlet: {len(_ups)}  {_ups[:5]}")
+    logger.info(f"  upstream dict entry for outlet: {upstream.get(outlet_rc, [][:5])}")
+    # END DIAGNOSTIC
+
     sampled_cells = _trace_channel_ordered(
         outlet_rc, upstream, sample_dist, cellsize
     )

@@ -81,7 +81,7 @@ MIN_DRAINAGE_AREA_CELLS = 900000 if TEST_RUN else 10000000    # cells (~4 km² a
 
 # Number of border cells to blank on all four edges before thresholding.
 # Edge cells drain off-raster in D8, accumulating spurious flow.
-BORDER_CELLS = 3
+BORDER_CELLS = 0
 
 # Minimum distance separating the outlet points (in meters)
 MIN_OUTLET_SEPARATION = 2000
@@ -109,7 +109,7 @@ SNAP_DISTANCE = 50
 STREAM_THRESHOLD        = 50000 if TEST_RUN else 1000000
 
 # --- KSN ANALYSIS PARAMETERS ---
-MIN_DRAINAGE_AREA_M2 = 10000 if TEST_RUN else 1000000  # 0.1 km² for test
+MIN_DRAINAGE_AREA_M2 = 200000 if TEST_RUN else 1000000
 REFERENCE_CONCAVITY  = 0.45          # Reference concavity index (theta_ref)
 SMOOTHING_WINDOW     = 5             # Window size (cells) for gradient smoothing
 SAMPLE_DISTANCE      = 50            # Sample points every N meters along streams
