@@ -526,6 +526,7 @@ def extract_longest_branch(
     for outlet in mouth_nodes:
         headwater, dist, prev = _longest_upstream_path(outlet, upstream_graph)
         path_length = dist.get(headwater, 0.0)
+        logger.info(f"    outlet {outlet}: longest path = {path_length:.1f} m")
         if path_length > best_length:
             best_length    = path_length
             best_headwater = headwater
