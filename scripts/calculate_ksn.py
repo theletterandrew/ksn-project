@@ -44,6 +44,7 @@ import config
 # CONFIG — Edit these before running
 # =============================================================================
 
+DEM_MOSAIC         = config.DATA_DEM_MOSAIC / "dem_mosaic.tif"  # Full mosaic — used to detect mosaic boundary edges
 WATERSHED_DEMS_DIR = config.DATA_WATERSHEDS   # Watershed DEMs + FAC + FDR rasters
 OUTPUT_DIR         = config.DATA_KSN          # Output ksn shapefiles
 
@@ -232,8 +233,8 @@ def extract_stream_points(
 
     # ------------------------------------------------------------------
     # 3. Load per-watershed FDR — must be grid-aligned to DEM.
-    #    Loaded before stream_mask so we can use FDR=0 edge detection
-    #    to blank mosaic-boundary cells from the stream mask.
+    #    Loaded before stream_mask so we can use mosaic-boundary
+    #    detection to blank spurious edge cells from the stream mask.
     # ------------------------------------------------------------------
     with rasterio.open(str(fdr_path)) as fdr_src:
         if fdr_src.transform != transform or fdr_src.shape != dem.shape:
@@ -257,32 +258,54 @@ def extract_stream_points(
 
     stream_mask = (area_m2 >= min_area_m2) & dem_valid
 
-    # Blank stream_mask border cells where FDR=0 (unresolved mosaic edge).
-    # This mirrors the same fix in stream_extraction_wbt.py and suppresses
-    # the spurious high-accumulation line that WBT D8 produces at the raster
-    # boundary. The FDR=0 check ensures we only blank true mosaic edges —
-    # not interior watershed edges where real channel cells may exist.
-    for edge_slice in [
-        (slice(0, 3),    slice(None)),    # top
-        (slice(-3, None), slice(None)),   # bottom
-        (slice(None),    slice(0, 3)),    # left
-        (slice(None),    slice(-3, None)), # right
-    ]:
-        if (fdr_raw[edge_slice] == 0).any():
-            stream_mask[edge_slice] = False
+    # ------------------------------------------------------------------
+    # 5. Blank stream_mask edges that touch the full mosaic boundary.
+    #
+    #    WBT D8 routing accumulates spurious flow along the outermost
+    #    rows/cols of the mosaic, producing a false high-accumulation
+    #    line at the raster edge. We detect which edges of this clipped
+    #    watershed actually touch the mosaic boundary by comparing
+    #    geographic coordinates, then blank only those edges.
+    #    This is more reliable than FDR=0 detection because a watershed
+    #    whose trunk channel runs near the mosaic edge will have valid
+    #    FDR values right up to the boundary.
+    # ------------------------------------------------------------------
+    try:
+        with rasterio.open(str(DEM_MOSAIC)) as mosaic_src:
+            mb = mosaic_src.bounds
+        ws_bounds = rasterio.transform.array_bounds(
+            dem.shape[0], dem.shape[1], transform
+        )
+        tol = cellsize * 0.5
+        b   = 3
+        # ws_bounds order: (left, bottom, right, top)
+        if abs(ws_bounds[1] - mb.bottom) < tol:
+            stream_mask[-b:, :] = False
+            logger.info("  Blanked bottom edge (mosaic boundary)")
+        if abs(ws_bounds[3] - mb.top) < tol:
+            stream_mask[:b,  :] = False
+            logger.info("  Blanked top edge (mosaic boundary)")
+        if abs(ws_bounds[0] - mb.left) < tol:
+            stream_mask[:,  :b] = False
+            logger.info("  Blanked left edge (mosaic boundary)")
+        if abs(ws_bounds[2] - mb.right) < tol:
+            stream_mask[:, -b:] = False
+            logger.info("  Blanked right edge (mosaic boundary)")
+    except Exception as e:
+        logger.warning(f"  Could not check mosaic bounds for edge blanking: {e}")
 
     if not stream_mask.any():
         logger.warning("  No stream cells above threshold")
         return None
 
     # ------------------------------------------------------------------
-    # 5. Compute slope with nodata-aware smoothing
+    # 6. Compute slope with nodata-aware smoothing
     # ------------------------------------------------------------------
     logger.info("  Computing slope...")
     slope = calculate_gradient_smoothed(dem, nodata, cellsize, window_size)
 
     # ------------------------------------------------------------------
-    # 6. Compute ksn = slope * area^theta
+    # 7. Compute ksn = slope * area^theta
     # ------------------------------------------------------------------
     logger.info("  Computing ksn...")
     area_safe = np.maximum(area_m2, 1.0)
@@ -290,7 +313,7 @@ def extract_stream_points(
     ksn = np.where(np.isfinite(ksn), ksn, 0.0)
 
     # ------------------------------------------------------------------
-    # 7. Filter invalid pixels before sampling
+    # 8. Filter invalid pixels before sampling
     # ------------------------------------------------------------------
     stream_rows, stream_cols = np.where(stream_mask)
     valid = (
@@ -310,7 +333,7 @@ def extract_stream_points(
     valid_stream_mask[stream_rows, stream_cols] = True
 
     # ------------------------------------------------------------------
-    # 8. Sample along D8 flow paths (outlet -> headwater)
+    # 9. Sample along D8 flow paths (outlet -> headwater)
     # ------------------------------------------------------------------
     logger.info("  Tracing channel paths for ordered sampling...")
     upstream = _build_upstream_index(fdr_raw, fdr_nodata, valid_stream_mask)
@@ -330,7 +353,7 @@ def extract_stream_points(
     logger.info(f"  {len(sampled_cells)} sample points along channel paths")
 
     # ------------------------------------------------------------------
-    # 9. Build output GeoDataFrame
+    # 10. Build output GeoDataFrame
     # ------------------------------------------------------------------
     s_rows = [rc[0] for rc in sampled_cells]
     s_cols = [rc[1] for rc in sampled_cells]
