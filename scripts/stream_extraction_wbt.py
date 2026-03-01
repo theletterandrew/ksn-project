@@ -508,7 +508,10 @@ def extract_longest_branch(
     if not upstream_graph:
         logger.warning("  Segment graph is empty — skipping longest branch.")
         return
-
+    logger.info(f"  Total nodes in graph: {len(upstream_graph)}")
+    logger.info(f"  Mouth nodes found: {len(mouth_nodes)}")
+    for mn in list(mouth_nodes)[:5]:
+        logger.info(f"    mouth candidate: {mn}")
     # If no clean outlet found (e.g. every node has a downstream neighbour
     # because all outlets were filtered), fall back to the node with the
     # lowest total upstream degree as a best-guess outlet.
