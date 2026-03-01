@@ -81,7 +81,7 @@ MIN_DRAINAGE_AREA_CELLS = 900000 if TEST_RUN else 10000000    # cells (~4 km² a
 
 # Number of border cells to blank on all four edges before thresholding.
 # Edge cells drain off-raster in D8, accumulating spurious flow.
-BORDER_CELLS = 0
+BORDER_CELLS = 3
 
 # Minimum distance separating the outlet points (in meters)
 MIN_OUTLET_SEPARATION = 2000
