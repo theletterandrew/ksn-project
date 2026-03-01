@@ -79,6 +79,11 @@ THRESHOLD = config.STREAM_THRESHOLD
 # Removes single-pixel stubs and short noise branches.
 MIN_PIXELS = 10
 
+# Minimum stream length in metres. Segments shorter than this are dropped
+# after conversion to LineStrings (threshold is in real map units, not pixels).
+# Set in config.py as MIN_STREAM_LENGTH_M.
+MIN_STREAM_LENGTH_M = config.MIN_STREAM_LENGTH_M
+
 # Number of border cells to blank on all four edges before thresholding.
 # Edge cells drain "off the raster" in D8 routing and accumulate spurious
 # flow, creating false streams along the DEM boundary.
@@ -317,9 +322,10 @@ def main():
             logger.error("Run wbt_hydrology.py first.")
             sys.exit(1)
 
-    logger.info(f"Threshold   : {THRESHOLD:,} cells (~{THRESHOLD * 4 / 1e6:.1f} km² at 2m)")
-    logger.info(f"Min pixels  : {MIN_PIXELS}")
-    logger.info(f"Border cells: {BORDER_CELLS}")
+    logger.info(f"Threshold        : {THRESHOLD:,} cells (~{THRESHOLD * 4 / 1e6:.1f} km² at 2m)")
+    logger.info(f"Min pixels       : {MIN_PIXELS}")
+    logger.info(f"Min stream length: {MIN_STREAM_LENGTH_M} m")
+    logger.info(f"Border cells     : {BORDER_CELLS}")
     logger.info("-" * 60)
 
     start_time = time.time()
@@ -434,6 +440,30 @@ def main():
         if out_path.exists():
             out_path.unlink()
 
+        # Convert all segments to LineStrings and apply length filter
+        lines = []
+        for seg in segments:
+            line = pixels_to_linestring(seg, transform)
+            if line.length > 0:
+                lines.append((seg, line))
+
+        before_len = len(lines)
+        if MIN_STREAM_LENGTH_M > 0:
+            lines = [(seg, line) for seg, line in lines if line.length >= MIN_STREAM_LENGTH_M]
+            dropped_len = before_len - len(lines)
+            if dropped_len:
+                logger.info(
+                    f"  Removed {dropped_len:,} segments shorter than "
+                    f"{MIN_STREAM_LENGTH_M} m (kept {len(lines):,})"
+                )
+
+        if not lines:
+            logger.error(
+                "No segments survived the minimum length filter. "
+                "Lower MIN_STREAM_LENGTH_M in config.py."
+            )
+            sys.exit(1)
+
         count = 0
         with fiona.open(
             str(out_path),
@@ -444,10 +474,7 @@ def main():
             layer="streams",
         ) as dst:
             batch = []
-            for seg in segments:
-                line = pixels_to_linestring(seg, transform)
-                if line.length == 0:
-                    continue
+            for seg, line in lines:
                 count += 1
                 batch.append({
                     "geometry": mapping(line),
