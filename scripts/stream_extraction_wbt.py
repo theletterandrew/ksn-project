@@ -424,32 +424,30 @@ def extract_longest_branch(
 
     logger.info("Step 7: Extracting longest mouth->headwater branch...")
 
-    # Build pixel->seg_index lookup from the raw pixel chains.
-    # Every pixel in every segment maps to that segment's index.
-    # This lets us find which segment a given pixel belongs to in O(1).
-    pixel_to_seg = {}
-    for i, (seg, line) in enumerate(lines):
-        for px in seg:
-            pixel_to_seg[px] = i
+    # Build lookup of segment mouths. Multiple segments can share a mouth
+    # pixel at a junction, so this is one-to-many.
+    mouth_to_seg_indices = defaultdict(list)
+    for i, (seg, _) in enumerate(lines):
+        mouth_to_seg_indices[seg[0]].append(i)
 
-    # For each segment, find upstream neighbours using the pixel adjacency
-    # graph (adj).  The source pixel of a segment (seg[-1]) has neighbours
-    # in adj; any neighbour that belongs to a DIFFERENT segment and whose
-    # mouth end (seg[0]) is adjacent to our source is an upstream tributary.
+    # For each segment, find tributaries that connect at its SOURCE end.
+    # Because segments are ordered mouth->source, walking upstream means
+    # stepping from current source to segments whose mouth is that source.
     #
-    # More directly: seg B flows into seg A if seg B's source pixel (B[-1])
-    # is adjacent (in adj) to seg A's mouth pixel (A[0]).
-    # Build: seg_index -> list of upstream seg indices
+    # We accept both exact pixel matches and 8-neighbour matches to be robust
+    # to tiny skeletonization artifacts around confluences.
     seg_upstream = defaultdict(list)
     for i, (seg_i, _) in enumerate(lines):
-        mouth_i = seg_i[0]
-        # Find all pixels adjacent to mouth_i in the skeleton
-        for nb in adj.get(mouth_i, []):
-            j = pixel_to_seg.get(nb)
-            if j is not None and j != i:
-                # nb belongs to seg j — check if nb is seg j's source end
-                if nb == lines[j][0][-1]:
+        source_i = seg_i[-1]
+        candidate_mouths = {source_i} | set(adj.get(source_i, []))
+        for mouth_px in candidate_mouths:
+            for j in mouth_to_seg_indices.get(mouth_px, []):
+                if j != i:
                     seg_upstream[i].append(j)
+
+        # Deduplicate while preserving deterministic order.
+        if seg_upstream[i]:
+            seg_upstream[i] = sorted(set(seg_upstream[i]))
 
     # Find the global outlet: segment with highest-FAC mouth pixel
     outlet_seg_idx = max(
