@@ -396,27 +396,16 @@ def extract_longest_branch(
     logger: logging.Logger,
 ) -> None:
     """
-    Find the longest flow-direction-coherent path (outlet -> headwater)
-    and write those segments to *out_path*.
+    Find the globally longest connected outlet->headwater path and write
+    those segments to *out_path*.
 
-    Algorithm
-    ---------
-    Uses a greedy FAC-based graph traversal:
+    We first build a directed upstream graph using segment topology:
+    segment j is upstream of segment i when j's mouth pixel touches i's
+    source pixel (exactly or as an 8-neighbour).
 
-    1. Build a lookup: for each segment mouth pixel, which segment index
-       has that mouth?  (mouth_to_seg)
-    2. Build a lookup: for each segment source pixel, which segment(s)
-       have that source?  (source_to_segs — multiple tributaries share
-       a junction as their source end)
-    3. Find the global outlet: the segment whose mouth pixel has the
-       highest FAC value across the entire network.
-    4. From the outlet, greedily walk upstream: at each junction (where
-       multiple tributaries flow in) pick the one whose mouth pixel has
-       the highest FAC — that is the main stem.
-    5. Continue until no further upstream segment exists (headwater).
-
-    This avoids all graph-building complexity.  It is O(N) and correct
-    for any D8 network because FAC strictly increases downstream.
+    Then we compute the maximum cumulative length path in that directed
+    graph (dynamic programming on DFS). This returns the true longest
+    branch by geometry length, not merely the highest-FAC tributary.
     """
     if not lines:
         logger.warning("  No segments available for longest-branch extraction.")
@@ -424,65 +413,89 @@ def extract_longest_branch(
 
     logger.info("Step 7: Extracting longest mouth->headwater branch...")
 
-    # Build pixel->seg_index lookup from the raw pixel chains.
-    # Every pixel in every segment maps to that segment's index.
-    # This lets us find which segment a given pixel belongs to in O(1).
-    pixel_to_seg = {}
-    for i, (seg, line) in enumerate(lines):
-        for px in seg:
-            pixel_to_seg[px] = i
+    # Build lookup of segment mouths. Multiple segments can share a mouth
+    # pixel at a junction, so this is one-to-many.
+    mouth_to_seg_indices = defaultdict(list)
+    for i, (seg, _) in enumerate(lines):
+        mouth_to_seg_indices[seg[0]].append(i)
 
-    # For each segment, find upstream neighbours using the pixel adjacency
-    # graph (adj).  The source pixel of a segment (seg[-1]) has neighbours
-    # in adj; any neighbour that belongs to a DIFFERENT segment and whose
-    # mouth end (seg[0]) is adjacent to our source is an upstream tributary.
-    #
-    # More directly: seg B flows into seg A if seg B's source pixel (B[-1])
-    # is adjacent (in adj) to seg A's mouth pixel (A[0]).
-    # Build: seg_index -> list of upstream seg indices
+    # Build directed upstream adjacency:
+    # i -> [j1, j2, ...] where each j flows into i from upstream.
     seg_upstream = defaultdict(list)
     for i, (seg_i, _) in enumerate(lines):
-        mouth_i = seg_i[0]
-        # Find all pixels adjacent to mouth_i in the skeleton
-        for nb in adj.get(mouth_i, []):
-            j = pixel_to_seg.get(nb)
-            if j is not None and j != i:
-                # nb belongs to seg j — check if nb is seg j's source end
-                if nb == lines[j][0][-1]:
+        source_i = seg_i[-1]
+        candidate_mouths = {source_i} | set(adj.get(source_i, []))
+        for mouth_px in candidate_mouths:
+            for j in mouth_to_seg_indices.get(mouth_px, []):
+                if j != i:
                     seg_upstream[i].append(j)
+        if seg_upstream[i]:
+            seg_upstream[i] = sorted(set(seg_upstream[i]))
 
-    # Find the global outlet: segment with highest-FAC mouth pixel
-    outlet_seg_idx = max(
-        range(len(lines)),
-        key=lambda i: float(fac_arr[lines[i][0][0][0], lines[i][0][0][1]])
-    )
-    outlet_fac = float(fac_arr[lines[outlet_seg_idx][0][0][0], lines[outlet_seg_idx][0][0][1]])
-    logger.info(
-        f"  Global outlet: seg[{outlet_seg_idx}] "
-        f"mouth={lines[outlet_seg_idx][0][0]} FAC={outlet_fac:.0f} "
-        f"upstream_segs={seg_upstream.get(outlet_seg_idx, [])}"
-    )
+    seg_lengths = [line.length for _, line in lines]
+    memo = {}
 
-    # Walk upstream from outlet, always taking the highest-FAC upstream seg
+    def best_upstream_path(seg_idx, active):
+        # Returns (total_length_from_seg_to_best_headwater, [path indices]).
+        if seg_idx in memo:
+            return memo[seg_idx]
+        if seg_idx in active:
+            # Safety against rare topology cycles.
+            return seg_lengths[seg_idx], [seg_idx]
+
+        active.add(seg_idx)
+        best_total = seg_lengths[seg_idx]
+        best_path = [seg_idx]
+
+        for up_idx in seg_upstream.get(seg_idx, []):
+            up_total, up_path = best_upstream_path(up_idx, active)
+            candidate_total = seg_lengths[seg_idx] + up_total
+            if candidate_total > best_total:
+                best_total = candidate_total
+                best_path = [seg_idx] + up_path
+            elif np.isclose(candidate_total, best_total):
+                # Tie-breaker: prefer branch with higher upstream mouth FAC.
+                cand_fac = float(fac_arr[lines[up_idx][0][0][0], lines[up_idx][0][0][1]])
+                curr_next = best_path[1] if len(best_path) > 1 else None
+                curr_fac = float("-inf")
+                if curr_next is not None:
+                    curr_fac = float(fac_arr[lines[curr_next][0][0][0], lines[curr_next][0][0][1]])
+                if cand_fac > curr_fac:
+                    best_path = [seg_idx] + up_path
+
+        active.remove(seg_idx)
+        memo[seg_idx] = (best_total, best_path)
+        return memo[seg_idx]
+
+    # Evaluate all possible downstream starts (supports multi-outlet networks)
+    # and pick the globally longest connected branch.
+    best_total = -1.0
     path_indices = []
-    visited      = set()
-    current      = outlet_seg_idx
+    downstream_start_idx = None
+    for i in range(len(lines)):
+        total, path = best_upstream_path(i, set())
+        if total > best_total:
+            best_total = total
+            path_indices = path
+            downstream_start_idx = i
 
-    while current is not None and current not in visited:
-        path_indices.append(current)
-        visited.add(current)
-        tributaries = seg_upstream.get(current, [])
-        if not tributaries:
-            break
-        # Follow the tributary whose mouth has the highest FAC (main stem)
-        current = max(
-            tributaries,
-            key=lambda i: float(fac_arr[lines[i][0][0][0], lines[i][0][0][1]])
-        )
+    if downstream_start_idx is None or not path_indices:
+        logger.warning("  Could not determine a valid longest branch path.")
+        return
 
-    total_length = sum(lines[i][1].length for i in path_indices)
+    start_fac = float(
+        fac_arr[
+            lines[downstream_start_idx][0][0][0],
+            lines[downstream_start_idx][0][0][1],
+        ]
+    )
     logger.info(
-        f"  Longest path: {total_length:.1f} m  ({total_length/1000:.2f} km)"
+        f"  Selected downstream start: seg[{downstream_start_idx}] "
+        f"mouth={lines[downstream_start_idx][0][0]} FAC={start_fac:.0f} "
+        f"upstream_segs={seg_upstream.get(downstream_start_idx, [])}"
+    )
+    logger.info(
+        f"  Longest path: {best_total:.1f} m  ({best_total/1000:.2f} km)"
         f"  |  {len(path_indices)} segments  outlet->headwater"
     )
 
