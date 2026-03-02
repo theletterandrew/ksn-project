@@ -62,18 +62,6 @@ def run_setup():
     else:
         print(f"      [MISSING] LAStools (laszip.exe) not found at: {lastools_check}")
 
-    # 4. Check ArcGIS Environment
-    print("\n[3/3] Checking GIS Environment...")
-    try:
-        import arcpy
-        print(f"      [PASS] ArcPy found ({sys.executable})")
-        if arcpy.CheckExtension("Spatial") == "Available":
-            print("      [PASS] Spatial Analyst Extension is available.")
-        else:
-            print("      [WARN] Spatial Analyst NOT available. Check your license.")
-    except ImportError:
-        print("      [FAIL] ArcPy not found. Are you in the ArcGIS Python Command Prompt?")
-
     print("\n==========================================")
     print(" Setup Complete. Check the [MISSING] items above.")
     print("==========================================")
