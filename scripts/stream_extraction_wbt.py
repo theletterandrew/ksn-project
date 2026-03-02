@@ -419,8 +419,12 @@ def extract_longest_branch(
     for i, (seg, _) in enumerate(lines):
         mouth_to_seg_indices[seg[0]].append(i)
 
-    # Build directed upstream adjacency:
-    # i -> [j1, j2, ...] where each j flows into i from upstream.
+    # For each segment, find tributaries that connect at its SOURCE end.
+    # Because segments are ordered mouth->source, walking upstream means
+    # stepping from current source to segments whose mouth is that source.
+    #
+    # We accept both exact pixel matches and 8-neighbour matches to be robust
+    # to tiny skeletonization artifacts around confluences.
     seg_upstream = defaultdict(list)
     for i, (seg_i, _) in enumerate(lines):
         source_i = seg_i[-1]
@@ -483,16 +487,19 @@ def extract_longest_branch(
         logger.warning("  Could not determine a valid longest branch path.")
         return
 
-    start_fac = float(
-        fac_arr[
-            lines[downstream_start_idx][0][0][0],
-            lines[downstream_start_idx][0][0][1],
-        ]
+        # Deduplicate while preserving deterministic order.
+        if seg_upstream[i]:
+            seg_upstream[i] = sorted(set(seg_upstream[i]))
+
+    # Find the global outlet: segment with highest-FAC mouth pixel
+    outlet_seg_idx = max(
+        range(len(lines)),
+        key=lambda i: float(fac_arr[lines[i][0][0][0], lines[i][0][0][1]])
     )
     logger.info(
-        f"  Selected downstream start: seg[{downstream_start_idx}] "
-        f"mouth={lines[downstream_start_idx][0][0]} FAC={start_fac:.0f} "
-        f"upstream_segs={seg_upstream.get(downstream_start_idx, [])}"
+        f"  Selected downstream start: seg[{best_start}] "
+        f"mouth={lines[best_start][0][0]} FAC={start_fac:.0f} "
+        f"upstream_segs={seg_upstream.get(best_start, [])}"
     )
     logger.info(
         f"  Longest path: {best_total:.1f} m  ({best_total/1000:.2f} km)"
