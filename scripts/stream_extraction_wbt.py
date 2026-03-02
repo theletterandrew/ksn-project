@@ -435,7 +435,24 @@ def extract_longest_branch(
                     seg_upstream[i].append(j)
         if seg_upstream[i]:
             seg_upstream[i] = sorted(set(seg_upstream[i]))
+    # --- after the seg_upstream construction loop ---
 
+    # Break bidirectional (mutual) links at junctions.
+    # If i lists j as upstream AND j lists i as upstream, the shorter
+    # segment is the tributary; remove the link that points the wrong way.
+    for i in list(seg_upstream.keys()):
+        for j in list(seg_upstream[i]):
+            if i in seg_upstream.get(j, []):
+                # Mutual link — keep the direction where the downstream
+                # segment is longer (higher FAC at mouth is a proxy).
+                fac_i = float(fac_arr[lines[i][0][0][0], lines[i][0][0][1]])
+                fac_j = float(fac_arr[lines[j][0][0][0], lines[j][0][0][1]])
+                if fac_i >= fac_j:
+                    # i is more downstream → j should NOT list i as upstream
+                    seg_upstream[j] = [k for k in seg_upstream[j] if k != i]
+                else:
+                    # j is more downstream → i should NOT list j as upstream
+                    seg_upstream[i] = [k for k in seg_upstream[i] if k != j]
     seg_lengths = [line.length for _, line in lines]
     memo = {}
 
@@ -487,19 +504,12 @@ def extract_longest_branch(
         logger.warning("  Could not determine a valid longest branch path.")
         return
 
-        # Deduplicate while preserving deterministic order.
-        if seg_upstream[i]:
-            seg_upstream[i] = sorted(set(seg_upstream[i]))
-
-    # Find the global outlet: segment with highest-FAC mouth pixel
-    outlet_seg_idx = max(
-        range(len(lines)),
-        key=lambda i: float(fac_arr[lines[i][0][0][0], lines[i][0][0][1]])
-    )
+    # Log the selected downstream start using the correct variable name.
+    start_fac = float(fac_arr[lines[downstream_start_idx][0][0][0], lines[downstream_start_idx][0][0][1]])
     logger.info(
-        f"  Selected downstream start: seg[{best_start}] "
-        f"mouth={lines[best_start][0][0]} FAC={start_fac:.0f} "
-        f"upstream_segs={seg_upstream.get(best_start, [])}"
+        f"  Selected downstream start: seg[{downstream_start_idx}] "
+        f"mouth={lines[downstream_start_idx][0][0]} FAC={start_fac:.0f} "
+        f"upstream_segs={seg_upstream.get(downstream_start_idx, [])}"
     )
     logger.info(
         f"  Longest path: {best_total:.1f} m  ({best_total/1000:.2f} km)"
