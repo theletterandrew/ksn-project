@@ -234,7 +234,7 @@ def collapse_junction_clusters(adj: dict) -> dict:
 
     if not any(v != k for k, v in remap.items()):
         # No clusters to collapse — return unchanged
-        return adj
+        return adj, {}
 
     # Rewrite adjacency: replace every remapped node, drop self-loops and dups
     new_adj = defaultdict(set)
@@ -253,7 +253,7 @@ def collapse_junction_clusters(adj: dict) -> dict:
         if new_node not in new_adj:
             new_adj[new_node] = set()
 
-    return {k: list(v) for k, v in new_adj.items()}
+    return {k: list(v) for k, v in new_adj.items()}, remap
 
 
 def trace_segments(adj: dict) -> list:
@@ -331,42 +331,28 @@ def trace_segments(adj: dict) -> list:
     return segments
 
 
-def order_segment_by_fdr(
+def order_segment_by_fac(
     chain: list,
-    fdr_arr: np.ndarray,
-    fdr_nodata,
+    fac_arr: np.ndarray,
 ) -> list:
     """
-    Orient a pixel chain so it runs mouth->source (downstream->upstream).
+    Orient a pixel chain so it runs mouth->source (downstream->upstream)
+    using flow accumulation values.
 
-    The downstream end is the pixel whose D8 pointer exits the chain
-    (points to a pixel NOT in the chain, or to nodata/raster boundary).
-    If both ends qualify (or neither does), keep the original order.
+    The mouth (downstream) end always has higher FAC than the source
+    (upstream) end — it has accumulated more drainage area.  This is
+    unambiguous and works for trunk segments, tributaries, and junction-
+    adjacent segments alike, avoiding the FDR exit-chain logic which fails
+    when both ends of a segment happen to exit the chain (e.g. trunk
+    segments whose junction pixels point downstream out of the chain at
+    both ends).
     """
-    chain_set = set(map(tuple, chain))
-    nrows, ncols = fdr_arr.shape
+    fac_first = float(fac_arr[chain[0][0],  chain[0][1]])
+    fac_last  = float(fac_arr[chain[-1][0], chain[-1][1]])
 
-    def _exits_chain(pixel):
-        r, c = pixel
-        fdr_val = int(fdr_arr[r, c])
-        if fdr_nodata is not None and fdr_val == int(fdr_nodata):
-            return False
-        offset = D8_OFFSETS.get(fdr_val)
-        if offset is None:
-            return False
-        nr, nc = r + offset[0], c + offset[1]
-        # Exits if next cell is outside raster or not in the chain
-        if not (0 <= nr < nrows and 0 <= nc < ncols):
-            return True
-        return (nr, nc) not in chain_set
-
-    first_exits = _exits_chain(chain[0])
-    last_exits  = _exits_chain(chain[-1])
-
-    if last_exits and not first_exits:
-        # Last pixel is downstream — reverse so mouth is at index 0
+    if fac_last > fac_first:
+        # Last pixel has more drainage area — it is downstream, so reverse
         return list(reversed(chain))
-    # first_exits (or ambiguous) — keep as-is
     return chain
 
 
@@ -401,140 +387,36 @@ def pixels_to_linestring(chain: list, transform) -> LineString:
 
 
 
-def build_directed_segment_graph(lines: list, fac_arr: np.ndarray):
-    """
-    Build a *directed* node graph from (seg, LineString) pairs using the
-    integer pixel coordinates from the raw pixel chains, not the floating-
-    point map coordinates.
-
-    Pixel coordinates are exact integers so there is no float-jitter problem.
-    Segments are already ordered mouth->source (seg[0] = downstream pixel),
-    so each segment contributes one directed edge:
-        mouth_pixel  -->  source_pixel
-
-    Outlet detection uses flow accumulation rather than topology alone.
-    For each weakly-connected component, the node whose mouth pixel has the
-    highest FAC value is the true outlet — this is robust even when streams
-    exit through the raster boundary (all clipped DEMs do this).
-
-    Returns
-    -------
-    upstream   : {pixel: [(upstream_pixel, seg_index, length_m), ...]}
-    downstream : {pixel: [(downstream_pixel, seg_index, length_m), ...]}
-    mouth_nodes: one outlet pixel per connected component (highest FAC)
-    """
-    upstream   = defaultdict(list)
-    downstream = defaultdict(list)
-    all_nodes  = set()
-
-    for i, (seg, line) in enumerate(lines):
-        mouth  = seg[0]   # (row, col) — downstream end
-        source = seg[-1]  # (row, col) — upstream / headwater end
-        length = line.length
-        upstream[mouth].append((source, i, length))
-        downstream[source].append((mouth, i, length))
-        all_nodes.update([mouth, source])
-
-    # Build undirected adjacency for connected-component detection
-    undirected = defaultdict(set)
-    for node, nbrs in upstream.items():
-        for nb, _, _ in nbrs:
-            undirected[node].add(nb)
-            undirected[nb].add(node)
-    for node in all_nodes:
-        if node not in undirected:
-            undirected[node] = set()
-
-    # Find connected components via BFS
-    visited    = set()
-    components = []
-    for start in all_nodes:
-        if start in visited:
-            continue
-        comp  = set()
-        queue = deque([start])
-        while queue:
-            n = queue.popleft()
-            if n in visited:
-                continue
-            visited.add(n)
-            comp.add(n)
-            queue.extend(undirected[n] - visited)
-        components.append(comp)
-
-    # For each component, pick the node with the highest FAC value as outlet.
-    # We look at every node that appears as a mouth end (seg[0]) of any segment
-    # within the component, since only mouth-end pixels can be outlets.
-    mouth_pixels_set = {seg[0] for seg, _ in lines}
-
-    mouth_nodes = set()
-    for comp in components:
-        candidates = comp & mouth_pixels_set
-        if not candidates:
-            # Fallback: any node in the component
-            candidates = comp
-        best = max(candidates, key=lambda p: float(fac_arr[p[0], p[1]]))
-        mouth_nodes.add(best)
-
-    return dict(upstream), dict(downstream), mouth_nodes
-
-
-def _longest_upstream_path(outlet, upstream_graph):
-    """
-    Find the longest path from *outlet* to any headwater by traversing the
-    directed upstream graph.  Uses iterative DP (topological-order relaxation)
-    so it is exact for DAGs (which a D8 stream network always is).
-
-    Returns
-    -------
-    best_headwater : the node at the far end of the longest path
-    dist           : {node: longest distance from outlet to that node}
-    prev           : {node: (parent_node, seg_index)} for path reconstruction
-    """
-    # Iterative BFS/DP: process nodes in upstream order (BFS layers from outlet)
-    dist = {outlet: 0.0}
-    prev = {outlet: None}
-    queue = deque([outlet])
-    best_headwater, max_dist = outlet, 0.0
-
-    while queue:
-        node = queue.popleft()
-        for nb, seg_idx, length in upstream_graph.get(node, []):
-            new_dist = dist[node] + length
-            if nb not in dist or new_dist > dist[nb]:
-                dist[nb] = new_dist
-                prev[nb] = (node, seg_idx)
-                queue.append(nb)
-                if new_dist > max_dist:
-                    max_dist = new_dist
-                    best_headwater = nb
-
-    return best_headwater, dist, prev
-
-
 def extract_longest_branch(
     lines: list,
     fac_arr: np.ndarray,
+    adj: dict,
     out_path: Path,
     out_crs,
     logger: logging.Logger,
 ) -> None:
     """
     Find the longest flow-direction-coherent path (outlet -> headwater)
-    in the stream network and write those segments to *out_path*.
-
-    Unlike the previous double-BFS approach, this uses a *directed* graph
-    so the path can never cross a junction — it only ever travels upstream
-    along one tributary at each confluence, matching true stream topology.
+    and write those segments to *out_path*.
 
     Algorithm
     ---------
-    1. Build a directed graph: edges point mouth -> source (upstream).
-    2. Identify outlet node(s): nodes with no downstream neighbours
-       (nothing drains into them).
-    3. For each outlet run a longest-path DP upstream (exact on DAGs).
-    4. Keep the globally longest path across all outlets.
-    5. Reconstruct and write the ordered segment list.
+    Uses a greedy FAC-based graph traversal:
+
+    1. Build a lookup: for each segment mouth pixel, which segment index
+       has that mouth?  (mouth_to_seg)
+    2. Build a lookup: for each segment source pixel, which segment(s)
+       have that source?  (source_to_segs — multiple tributaries share
+       a junction as their source end)
+    3. Find the global outlet: the segment whose mouth pixel has the
+       highest FAC value across the entire network.
+    4. From the outlet, greedily walk upstream: at each junction (where
+       multiple tributaries flow in) pick the one whose mouth pixel has
+       the highest FAC — that is the main stem.
+    5. Continue until no further upstream segment exists (headwater).
+
+    This avoids all graph-building complexity.  It is O(N) and correct
+    for any D8 network because FAC strictly increases downstream.
     """
     if not lines:
         logger.warning("  No segments available for longest-branch extraction.")
@@ -542,53 +424,73 @@ def extract_longest_branch(
 
     logger.info("Step 7: Extracting longest mouth->headwater branch...")
 
-    upstream_graph, downstream_graph, mouth_nodes = build_directed_segment_graph(lines, fac_arr)
+    # Build pixel->seg_index lookup from the raw pixel chains.
+    # Every pixel in every segment maps to that segment's index.
+    # This lets us find which segment a given pixel belongs to in O(1).
+    pixel_to_seg = {}
+    for i, (seg, line) in enumerate(lines):
+        for px in seg:
+            pixel_to_seg[px] = i
 
-    if not upstream_graph:
-        logger.warning("  Segment graph is empty — skipping longest branch.")
-        return
+    # For each segment, find upstream neighbours using the pixel adjacency
+    # graph (adj).  The source pixel of a segment (seg[-1]) has neighbours
+    # in adj; any neighbour that belongs to a DIFFERENT segment and whose
+    # mouth end (seg[0]) is adjacent to our source is an upstream tributary.
+    #
+    # More directly: seg B flows into seg A if seg B's source pixel (B[-1])
+    # is adjacent (in adj) to seg A's mouth pixel (A[0]).
+    # Build: seg_index -> list of upstream seg indices
+    seg_upstream = defaultdict(list)
+    for i, (seg_i, _) in enumerate(lines):
+        mouth_i = seg_i[0]
+        # Find all pixels adjacent to mouth_i in the skeleton
+        for nb in adj.get(mouth_i, []):
+            j = pixel_to_seg.get(nb)
+            if j is not None and j != i:
+                # nb belongs to seg j — check if nb is seg j's source end
+                if nb == lines[j][0][-1]:
+                    seg_upstream[i].append(j)
 
-    logger.info(f"  Outlet nodes found (one per basin, by max FAC): {len(mouth_nodes)}")
-
-    # Run longest-path DP from every outlet, keep the global best
-    best_headwater = None
-    best_dist      = {}
-    best_prev      = {}
-    best_outlet    = None
-    best_length    = 0.0
-
-    for outlet in mouth_nodes:
-        headwater, dist, prev = _longest_upstream_path(outlet, upstream_graph)
-        path_length = dist.get(headwater, 0.0)
-        logger.info(f"    outlet {outlet}: longest path = {path_length:.1f} m")
-        if path_length > best_length:
-            best_length    = path_length
-            best_headwater = headwater
-            best_dist      = dist
-            best_prev      = prev
-            best_outlet    = outlet
-
+    # Find the global outlet: segment with highest-FAC mouth pixel
+    outlet_seg_idx = max(
+        range(len(lines)),
+        key=lambda i: float(fac_arr[lines[i][0][0][0], lines[i][0][0][1]])
+    )
+    outlet_fac = float(fac_arr[lines[outlet_seg_idx][0][0][0], lines[outlet_seg_idx][0][0][1]])
     logger.info(
-        f"  Longest path: {best_length:.1f} m  ({best_length / 1000:.2f} km)"
-        f"  |  outlet -> headwater"
+        f"  Global outlet: seg[{outlet_seg_idx}] "
+        f"mouth={lines[outlet_seg_idx][0][0]} FAC={outlet_fac:.0f} "
+        f"upstream_segs={seg_upstream.get(outlet_seg_idx, [])}"
     )
 
-    # Reconstruct segment indices: walk prev[] from headwater back to outlet
-    path_seg_indices = []
-    cursor = best_headwater
-    while best_prev.get(cursor) is not None:
-        parent, seg_idx = best_prev[cursor]
-        path_seg_indices.append(seg_idx)
-        cursor = parent
-    path_seg_indices.reverse()   # now ordered outlet -> headwater
+    # Walk upstream from outlet, always taking the highest-FAC upstream seg
+    path_indices = []
+    visited      = set()
+    current      = outlet_seg_idx
 
-    logger.info(f"  Path segments: {len(path_seg_indices)}")
+    while current is not None and current not in visited:
+        path_indices.append(current)
+        visited.add(current)
+        tributaries = seg_upstream.get(current, [])
+        if not tributaries:
+            break
+        # Follow the tributary whose mouth has the highest FAC (main stem)
+        current = max(
+            tributaries,
+            key=lambda i: float(fac_arr[lines[i][0][0][0], lines[i][0][0][1]])
+        )
+
+    total_length = sum(lines[i][1].length for i in path_indices)
+    logger.info(
+        f"  Longest path: {total_length:.1f} m  ({total_length/1000:.2f} km)"
+        f"  |  {len(path_indices)} segments  outlet->headwater"
+    )
 
     schema = {
         "geometry": "LineString",
         "properties": {
             "seg_id":      "int",
-            "order_along": "int",    # 1 = most downstream
+            "order_along": "int",
             "length_m":    "float",
             "n_vertices":  "int",
         },
@@ -598,14 +500,10 @@ def extract_longest_branch(
         out_path.unlink()
 
     with fiona.open(
-        str(out_path),
-        mode="w",
-        driver="GPKG",
-        schema=schema,
-        crs=out_crs,
-        layer="longest_branch",
+        str(out_path), mode="w", driver="GPKG",
+        schema=schema, crs=out_crs, layer="longest_branch",
     ) as dst:
-        for order, idx in enumerate(path_seg_indices, start=1):
+        for order, idx in enumerate(path_indices, start=1):
             seg, line = lines[idx]
             dst.write({
                 "geometry": mapping(line),
@@ -706,7 +604,7 @@ def main():
         # segments that fragment the network.  Collapsing them first ensures
         # every branch point is represented by exactly one pixel.
         junc_before = sum(1 for nbrs in adj.values() if len(nbrs) >= 3)
-        adj = collapse_junction_clusters(adj)
+        adj, junction_remap = collapse_junction_clusters(adj)
         junc_after  = sum(1 for nbrs in adj.values() if len(nbrs) >= 3)
         if junc_before != junc_after:
             logger.info(
@@ -714,11 +612,38 @@ def main():
             )
 
         segments = trace_segments(adj)
+
+        # Apply the junction remap to every pixel chain so that segment
+        # endpoints use the canonical representative pixel, not the original
+        # pre-collapse pixel.  Without this, seg[0]/seg[-1] won't match the
+        # corresponding endpoint of the adjacent segment, fragmenting the
+        # directed graph used for longest-branch extraction.
+        if junction_remap:
+            segments = [
+                [junction_remap.get(px, px) for px in chain]
+                for chain in segments
+            ]
         logger.info(f"  Raw segments traced: {len(segments):,}")
 
-        # Filter short stubs
-        segments = [s for s in segments if len(s) >= MIN_PIXELS]
-        logger.info(f"  Segments after min-pixel filter ({MIN_PIXELS}px): {len(segments):,}")
+        # Filter short stubs — but protect segments that connect two junction
+        # pixels, since dropping them breaks network topology regardless of length.
+        # A segment is a connector if BOTH endpoints are junction pixels
+        # (degree >= 3 in the collapsed adjacency graph).
+        junction_pixels = {n for n, nbrs in adj.items() if len(nbrs) >= 3}
+        kept_segs, dropped_stubs, protected_connectors = [], 0, 0
+        for s in segments:
+            both_ends_are_junctions = s[0] in junction_pixels and s[-1] in junction_pixels
+            if len(s) >= MIN_PIXELS or both_ends_are_junctions:
+                kept_segs.append(s)
+                if len(s) < MIN_PIXELS:
+                    protected_connectors += 1
+            else:
+                dropped_stubs += 1
+        segments = kept_segs
+        logger.info(
+            f"  Segments after min-pixel filter ({MIN_PIXELS}px): {len(segments):,} "
+            f"(dropped {dropped_stubs} stubs, protected {protected_connectors} short connectors)"
+        )
 
         if not segments:
             logger.error(
@@ -728,17 +653,28 @@ def main():
             sys.exit(1)
 
         # ------------------------------------------------------------------
-        # Step 5: Orient each segment mouth->source using FDR
+        # Step 5: Orient each segment mouth->source using FAC
         # ------------------------------------------------------------------
-        logger.info("Step 5: Orienting segments mouth->source using FDR...")
-        segments = [order_segment_by_fdr(s, fdr_arr, fdr_nodata) for s in segments]
+        logger.info("Step 5: Orienting segments mouth->source using FAC...")
+        # Re-read FAC for orientation (fac_data was freed after Step 1 to
+        # save memory; we only need it briefly here and in Step 7)
+        with rasterio.open(str(fac_path)) as _src:
+            fac_arr_orient = _src.read(1).astype(np.float32)
+        segments = [order_segment_by_fac(s, fac_arr_orient) for s in segments]
+        del fac_arr_orient
 
         # FIX 2: Remove segments whose downstream end drains off the raster
-        # edge. These are boundary artifacts — real watershed outlets that
-        # legitimately exit the DEM will have been removed by BORDER_CELLS
-        # already; anything surviving here is likely a false stream.
+        # edge — but ONLY if they are not junction connectors (both endpoints
+        # are junction pixels).  Removing a connector that happens to exit the
+        # edge would break network topology.
+        junction_pixels_set = {n for n, nbrs in adj.items() if len(nbrs) >= 3}
         before = len(segments)
-        segments = [s for s in segments if not drains_off_edge(s, fdr_arr, fdr_nodata)]
+        kept_drain = []
+        for s in segments:
+            is_connector = s[0] in junction_pixels_set and s[-1] in junction_pixels_set
+            if is_connector or not drains_off_edge(s, fdr_arr, fdr_nodata):
+                kept_drain.append(s)
+        segments = kept_drain
         removed = before - len(segments)
         if removed:
             logger.info(f"  Removed {removed:,} edge-draining segments (boundary artifacts)")
@@ -851,7 +787,7 @@ def main():
             # Re-read FAC for outlet detection (fac_data was freed after Step 1)
             with rasterio.open(str(fac_path)) as _src:
                 fac_arr_full = _src.read(1).astype(np.float32)
-            extract_longest_branch(lines, fac_arr_full, out_longest_path, out_crs, logger)
+            extract_longest_branch(lines, fac_arr_full, adj, out_longest_path, out_crs, logger)
             del fac_arr_full
 
         elapsed = time.time() - start_time
