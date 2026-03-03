@@ -245,6 +245,12 @@ def main():
 
             try:
                 make_watershed_mask(fdr_path, ws_mask_tif)
+                if not ws_mask_tif.exists():
+                    logger.error(f"  Mask creation failed for watershed {wid} — {ws_mask_tif} does not exist.")
+                    failed += 1
+                    continue
+                else:
+                    logger.info(f"  Mask written: {ws_mask_tif} ({ws_mask_tif.stat().st_size / 1024:.1f} KB)")
 
                 ok = run_wbt("LongestFlowpath", {
                     "d8_pntr"   : str(fdr_path),
