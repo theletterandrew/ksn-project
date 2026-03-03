@@ -453,6 +453,19 @@ def extract_longest_branch(
                 else:
                     # j is more downstream → i should NOT list j as upstream
                     seg_upstream[i] = [k for k in seg_upstream[i] if k != j]
+    # For each segment, keep only the highest-FAC upstream neighbour as the
+    # main-stem continuation.  Multiple upstream candidates means a confluence
+    # is ambiguously connected; we resolve it greedily by drainage area so
+    # best_upstream_path always follows a single unbranched chain.
+    for i in list(seg_upstream.keys()):
+        ups = seg_upstream[i]
+        if len(ups) > 1:
+            # Pick the upstream segment whose mouth pixel has the highest FAC
+            # (most accumulated drainage = main stem, not a side tributary).
+            def _mouth_fac(j):
+                r, c = lines[j][0][0]
+                return float(fac_arr[r, c])
+            seg_upstream[i] = [max(ups, key=_mouth_fac)]
     seg_lengths = [line.length for _, line in lines]
     memo = {}
 
@@ -493,7 +506,29 @@ def extract_longest_branch(
     best_total = -1.0
     path_indices = []
     downstream_start_idx = None
-    for i in range(len(lines)):
+    # Identify true outlet segments: segments whose mouth pixel is NOT the
+    # source pixel of any other segment.  Only outlets can be the downstream
+    # start of the longest branch — starting from a tributary mid-network
+    # would pick a path that begins partway up the stem and merges two
+    # branches rather than tracing a single outlet->headwater path.
+    all_source_pixels = {seg[-1] for seg, _ in lines}
+    outlet_indices = [
+        i for i, (seg, _) in enumerate(lines)
+        if seg[0] not in all_source_pixels
+    ]
+    if not outlet_indices:
+        # Fallback: degenerate network (e.g. a loop) — evaluate all segments.
+        logger.warning("  No outlet segments detected; falling back to evaluating all segments.")
+        outlet_indices = list(range(len(lines)))
+
+    logger.info(f"  Outlet segments found: {len(outlet_indices)}")
+
+    # Evaluate only outlet segments as possible downstream starts and
+    # pick the globally longest connected branch.
+    best_total = -1.0
+    path_indices = []
+    downstream_start_idx = None
+    for i in outlet_indices:          # <-- was: range(len(lines))
         total, path = best_upstream_path(i, set())
         if total > best_total:
             best_total = total
@@ -528,7 +563,14 @@ def extract_longest_branch(
 
     if out_path.exists():
         out_path.unlink()
-
+    for order, idx in enumerate(path_indices, start=1):
+        seg, line = lines[idx]
+        logger.info(f"  path seg[{idx}] order={order} mouth={seg[0]} source={seg[-1]} len={line.length:.1f}m")
+    if path_indices:
+        seg34 = lines[34][0]
+        logger.info(f"  seg[34] first 5 pixels: {seg34[:5]}")
+        logger.info(f"  seg[34] last  5 pixels: {seg34[-5:]}")
+        logger.info(f"  seg[34] total pixels: {len(seg34)}")
     with fiona.open(
         str(out_path), mode="w", driver="GPKG",
         schema=schema, crs=out_crs, layer="longest_branch",
