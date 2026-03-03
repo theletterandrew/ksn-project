@@ -112,15 +112,23 @@ def longest_flowpath(
     nrows, ncols = fdr_arr.shape
 
     # ------------------------------------------------------------------
-    # Step 1: Find outlet (highest FAC cell)
+    # Step 1: Find outlet (highest FAC cell, ignoring border pixels)
     # ------------------------------------------------------------------
+    BORDER = 3  # cells to ignore on each edge
+
     fac_valid = fac_arr.copy().astype(np.float64)
     if fac_nodata is not None:
         fac_valid[fac_arr == fac_nodata] = -1.0
     if fdr_nodata is not None:
         fac_valid[fdr_arr == int(fdr_nodata)] = -1.0
 
-    outlet_flat          = int(np.argmax(fac_valid))
+    # Blank border cells to suppress edge accumulation artifacts
+    fac_valid[:BORDER,  :] = -1.0
+    fac_valid[-BORDER:, :] = -1.0
+    fac_valid[:,  :BORDER] = -1.0
+    fac_valid[:, -BORDER:] = -1.0
+
+    outlet_flat         = int(np.argmax(fac_valid))
     outlet_r, outlet_c  = divmod(outlet_flat, ncols)
 
     if fac_valid[outlet_r, outlet_c] <= 0:
@@ -280,7 +288,7 @@ def main():
 
     if out_gpkg.exists():
         out_gpkg.unlink()
-        
+
     start_time = time.time()
     succeeded = skipped = failed = 0
 
