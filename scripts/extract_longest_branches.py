@@ -114,21 +114,16 @@ def run_wbt(tool, args, logger, timeout=300):
 
 
 def make_watershed_mask(fdr_path, out_path):
-    """
-    Write a mask raster aligned to the clipped FDR where all valid cells = 1.
-    LongestFlowpath uses this to define the watershed extent; since the FDR
-    is already clipped to the watershed boundary, this is sufficient.
-    """
     with rasterio.open(str(fdr_path)) as src:
         arr  = src.read(1)
         meta = src.meta.copy()
         nd   = src.nodata
 
-    NODATA_VAL = 0
-    mask = np.where(arr != nd, 1, NODATA_VAL).astype(np.int32) if nd is not None \
-           else np.ones(arr.shape, dtype=np.int32)
+    NODATA_VAL = int(nd) if nd is not None else -32768
+    mask = np.where(arr != nd, 1, NODATA_VAL).astype(np.int16) if nd is not None \
+           else np.ones(arr.shape, dtype=np.int16)
 
-    meta.update(dtype=rasterio.int32, nodata=NODATA_VAL)
+    meta.update(dtype=rasterio.int16, nodata=NODATA_VAL)
     with rasterio.open(str(out_path), "w", **meta) as dst:
         dst.write(mask, 1)
 
