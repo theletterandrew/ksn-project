@@ -287,8 +287,9 @@ def main():
                 succeeded += 1
 
             finally:
-                for tmp in [ws_mask_tif, flowpath_tif]:
-                    Path(tmp).unlink(missing_ok=True)
+                pass
+            #     for tmp in [ws_mask_tif, flowpath_tif]:
+            #         Path(tmp).unlink(missing_ok=True)
 
     elapsed = time.time() - start_time
     logger.info("=" * 60)
