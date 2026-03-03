@@ -42,6 +42,7 @@ from pathlib import Path
 
 import numpy as np
 import rasterio
+import geopandas as gpd
 import fiona
 from shapely.geometry import LineString, mapping
 
@@ -101,6 +102,8 @@ def longest_flowpath(
     fdr_nodata,
     fac_nodata,
     cell_size: float,
+    outlet_xy: tuple | None = None,
+    transform=None,
 ) -> list | None:
     """
     Find the longest D8 flowpath in a watershed raster.
