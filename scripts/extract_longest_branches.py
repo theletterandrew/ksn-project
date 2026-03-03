@@ -112,27 +112,27 @@ def longest_flowpath(
     nrows, ncols = fdr_arr.shape
 
     # ------------------------------------------------------------------
-    # Step 1: Find outlet (highest FAC cell, ignoring border pixels)
+    # Step 1: Find outlet cell
+    # If an outlet coordinate is provided, snap to the nearest valid
+    # FDR cell to that coordinate. Otherwise fall back to max FAC.
     # ------------------------------------------------------------------
-    BORDER = 3  # cells to ignore on each edge
-
-    fac_valid = fac_arr.copy().astype(np.float64)
-    if fac_nodata is not None:
-        fac_valid[fac_arr == fac_nodata] = -1.0
-    if fdr_nodata is not None:
-        fac_valid[fdr_arr == int(fdr_nodata)] = -1.0
-
-    # Blank border cells to suppress edge accumulation artifacts
-    fac_valid[:BORDER,  :] = -1.0
-    fac_valid[-BORDER:, :] = -1.0
-    fac_valid[:,  :BORDER] = -1.0
-    fac_valid[:, -BORDER:] = -1.0
-
-    outlet_flat         = int(np.argmax(fac_valid))
-    outlet_r, outlet_c  = divmod(outlet_flat, ncols)
-
-    if fac_valid[outlet_r, outlet_c] <= 0:
-        return None
+    if outlet_xy is not None and transform is not None:
+        ox, oy = outlet_xy
+        # Convert map coords to pixel indices
+        col_f, row_f = ~transform * (ox, oy)
+        outlet_r, outlet_c = int(row_f), int(col_f)
+        # Clamp to raster bounds
+        outlet_r = max(0, min(nrows - 1, outlet_r))
+        outlet_c = max(0, min(ncols - 1, outlet_c))
+    else:
+        # Fallback: highest FAC cell
+        fac_valid = fac_arr.copy()
+        if fac_nodata is not None:
+            fac_valid[fac_arr == fac_nodata] = -1.0
+        if fdr_nodata is not None:
+            fac_valid[fdr_arr == int(fdr_nodata)] = -1.0
+        outlet_flat        = int(np.argmax(fac_valid))
+        outlet_r, outlet_c = divmod(outlet_flat, ncols)
 
     # ------------------------------------------------------------------
     # Step 2: BFS upstream — accumulate distance from outlet
@@ -267,6 +267,17 @@ def main():
         )
         sys.exit(1)
 
+    # Load pour points and build gridcode -> (x, y) lookup
+    pour_pts = gpd.read_file(str(Path(SCRATCH_DIR) / "pourpoints_final.shp"))
+    wshed_shp = gpd.read_file(str(watersheds_shp))
+    joined = gpd.sjoin(pour_pts, wshed_shp[["gridcode", "geometry"]], how="left", predicate="within")
+    outlet_coords = {
+        int(row["gridcode"]): (row.geometry.x, row.geometry.y)
+        for _, row in joined.iterrows()
+        if not np.isnan(row["gridcode"])
+    }
+    logger.info(f"Pour points loaded    : {len(outlet_coords)} matched to watershed IDs")
+
     logger.info(f"Watersheds to process : {len(watersheds)}")
     logger.info(f"Output                : {out_gpkg}")
     logger.info(f"Min length            : {MIN_LENGTH_M} m")
@@ -312,7 +323,15 @@ def main():
                     fac_arr = src.read(1).astype(np.float64)
                     fac_nd  = src.nodata
 
-                chain = longest_flowpath(fdr_arr, fac_arr, fdr_nd, fac_nd, cell_size)
+                outlet_xy = outlet_coords.get(wid)
+                if outlet_xy is None:
+                    logger.warning(f"  No pour point found for watershed {wid}, falling back to max FAC.")
+
+                chain = longest_flowpath(
+                    fdr_arr, fac_arr, fdr_nd, fac_nd, cell_size,
+                    outlet_xy=outlet_xy,
+                    transform=transform,
+)
 
                 if chain is None:
                     logger.warning(f"  No valid flowpath found for watershed {wid}, skipping.")
