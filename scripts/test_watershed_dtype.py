@@ -1,4 +1,5 @@
 import rasterio
+import numpy as np
 
 fdr  = r"E:\ksn-project\data\watersheds\watershed_1_fdr.tif"
 mask = r"E:\ksn-project\data\scratch\watersheds\_ws_mask_1.tif"
