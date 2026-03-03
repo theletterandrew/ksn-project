@@ -982,8 +982,8 @@ def main():
     logger.info("Cleaning up intermediate files...")
     for tmp in [snapped_tif, watersheds_tif]:
         tmp.unlink(missing_ok=True)
-    for ext in [".shp", ".shx", ".dbf", ".prj", ".cpg"]:
-        (output_dir / f"pourpoints_final{ext}").unlink(missing_ok=True)
+    # for ext in [".shp", ".shx", ".dbf", ".prj", ".cpg"]:
+    #     (output_dir / f"pourpoints_final{ext}").unlink(missing_ok=True)
 
     elapsed = time.time() - start_time
     logger.info("=" * 60)
