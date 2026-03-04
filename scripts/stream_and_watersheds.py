@@ -82,7 +82,7 @@ MIN_PIXELS = config.MIN_PIXELS
 
 # Minimum stream segment length in map units (metres).
 # Headwater stubs shorter than this are dropped.  Set to 0 to disable.
-MIN_STREAM_LENGTH_M = MIN_STREAM_LENGTH_M
+MIN_STREAM_LENGTH_M = config.MIN_STREAM_LENGTH_M
 
 # Number of border cells to blank before thresholding.  Edge cells accumulate
 # spurious flow in D8 routing and produce false streams at the DEM boundary.
