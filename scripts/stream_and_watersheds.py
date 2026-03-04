@@ -51,36 +51,42 @@ import fiona
 import fiona.crs
 from shapely.geometry import LineString, mapping, shape as shapely_shape
 
+root_dir = Path(__file__).resolve().parent.parent
+if str(root_dir) not in sys.path:
+    sys.path.append(str(root_dir))
+
+import config
+
 # =============================================================================
 # CONFIG — edit these paths and parameters before running
 # =============================================================================
 
 # --- Input rasters ---
-DEM_FILE = Path(r"C:\path\to\dem_filled.tif")
-FAC_FILE = Path(r"C:\path\to\flow_accumulation.tif")
-FDR_FILE = Path(r"C:\path\to\flow_direction.tif")
+DEM_FILE = config.DATA_SCRATCH_WBT / "dem_filled.tif"
+FAC_FILE = config.DATA_SCRATCH_WBT / "flow_accumulation.tif"
+FDR_FILE = config.DATA_SCRATCH_WBT / "flow_direction.tif"
 
 # --- Output directory ---
-OUTPUT_DIR = Path(r"C:\path\to\output")
+OUTPUT_DIR = config.DATA_STREAMS
 
 # --- Stream extraction parameters ---
 # FAC threshold (cells). How many upstream cells must drain into a point
 # before it is considered a stream.  At 2 m resolution:
 #   500,000 cells  ≈  2 km²
 #   1,000,000 cells ≈  4 km²
-STREAM_THRESHOLD = 500_000
+STREAM_THRESHOLD = config.MIN_DRAINAGE_AREA_CELLS
 
 # Minimum number of skeleton pixels a segment must have to be kept.
 # Removes single-pixel stubs and very short noise branches.
-MIN_PIXELS = 10
+MIN_PIXELS = config.MIN_PIXELS
 
 # Minimum stream segment length in map units (metres).
 # Headwater stubs shorter than this are dropped.  Set to 0 to disable.
-MIN_STREAM_LENGTH_M = 50.0
+MIN_STREAM_LENGTH_M = MIN_STREAM_LENGTH_M
 
 # Number of border cells to blank before thresholding.  Edge cells accumulate
 # spurious flow in D8 routing and produce false streams at the DEM boundary.
-BORDER_CELLS = 3
+BORDER_CELLS = config.BORDER_CELLS
 
 # Set True to also write the longest outlet->headwater path.
 EXTRACT_LONGEST_BRANCH = True
@@ -92,7 +98,7 @@ MIN_WATERSHED_AREA_CELLS = STREAM_THRESHOLD
 
 # Search radius (in cells) when snapping raw outlets to the highest-FAC
 # stream cell nearby.  Prevents cross-tributary jumps.
-SNAP_DISTANCE = 10   # cells
+SNAP_DISTANCE = config.SNAP_DISTANCE   # cells
 
 # =============================================================================
 # END CONFIG

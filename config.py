@@ -80,7 +80,11 @@ MAX_WORKERS = 4
 MIN_DRAINAGE_AREA_CELLS = 900000 if TEST_RUN else 10000000    # cells (~4 km² at 2m resolution)
 
 # Length (m) of minimum tributary length. Filters out short stream segments.
-MIN_STREAM_LENGTH_M = 100         
+MIN_STREAM_LENGTH_M = 100
+
+# Minimum number of skeleton pixels a segment must have to be kept.
+# Removes single-pixel stubs and very short noise branches.
+MIN_PIXELS = 10
 
 # Number of border cells to blank on all four edges before thresholding.
 # Edge cells drain off-raster in D8, accumulating spurious flow.
@@ -106,7 +110,7 @@ MIN_WATERSHED_AREA = 200000 if TEST_RUN else 10000000
 
 # Pour points are snapped to the highest flow accumulation cell within
 # this distance to ensure they land exactly on the stream
-SNAP_DISTANCE = 50
+SNAP_DISTANCE = 10
 
 # --- STREAM EXTRACTION PARAMETERS ---
 STREAM_THRESHOLD        = 50000 if TEST_RUN else 1000000
