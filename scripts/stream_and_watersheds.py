@@ -436,6 +436,7 @@ def run_stream_extraction(
     # ------------------------------------------------------------------
     logger.info("Step 3: Skeletonizing...")
     skeleton = skeletonize_stream_mask(stream_mask, logger)
+    logger.info(f"  Skeleton pixels: {int(skeleton.sum()):,}")
     del stream_mask
 
     # ------------------------------------------------------------------

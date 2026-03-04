@@ -77,14 +77,14 @@ RES = 2.0
 MAX_WORKERS = 4
 
 # Stream threshold (in pixels)
-MIN_DRAINAGE_AREA_CELLS = 900000 if TEST_RUN else 10000000    # cells (~4 km² at 2m resolution)
+MIN_DRAINAGE_AREA_CELLS = 50_000 if TEST_RUN else 10000000    # cells (~4 km² at 2m resolution)
 
 # Length (m) of minimum tributary length. Filters out short stream segments.
 MIN_STREAM_LENGTH_M = 100
 
 # Minimum number of skeleton pixels a segment must have to be kept.
 # Removes single-pixel stubs and very short noise branches.
-MIN_PIXELS = 10
+MIN_PIXELS = 5
 
 # Number of border cells to blank on all four edges before thresholding.
 # Edge cells drain off-raster in D8, accumulating spurious flow.
@@ -106,7 +106,7 @@ WBT_BREACH_DIST = 100 if TEST_RUN else 1000
 # Watershed minimum drainage area threshold
 # Test dataset: (~0.4 km^2 at 2m resolution)
 # Full dataset: (~40 km² at 2m resolution)
-MIN_WATERSHED_AREA = 200000 if TEST_RUN else 10000000
+MIN_WATERSHED_AREA = 50_000 if TEST_RUN else 10000000
 
 # Pour points are snapped to the highest flow accumulation cell within
 # this distance to ensure they land exactly on the stream
