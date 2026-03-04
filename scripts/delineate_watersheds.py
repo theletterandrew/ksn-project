@@ -475,6 +475,85 @@ def sample_raster_at_points(
     return gdf
 
 
+def _snap_single_point_numpy(
+    orig_x: float,
+    orig_y: float,
+    orig_fac: float,
+    fac_arr: np.ndarray,
+    fac_nd,
+    transform,
+    max_radius_cells: int,
+    fac_ratio_cap: float,
+    logger: logging.Logger,
+) -> tuple:
+    """
+    Snap a single pour point to the nearest stream cell on its *own* tributary,
+    avoiding cross-stream jumps.
+
+    Works by expanding a search ring outward from the original cell and keeping
+    the closest cell whose FAC value is:
+      (a) >= orig_fac  (always at least as much drainage as the candidate), AND
+      (b) <= orig_fac * fac_ratio_cap  (hasn't jumped to the main trunk)
+
+    If no cell passes both tests within max_radius_cells, the point with the
+    highest FAC inside the cap is used; if nothing passes even that, the
+    original location is returned unchanged.
+
+    Returns (snapped_x, snapped_y, snapped_fac, was_moved: bool).
+    """
+    nrows, ncols = fac_arr.shape
+    col0, row0   = ~transform * (orig_x, orig_y)
+    row0, col0   = int(row0), int(col0)
+
+    cap = orig_fac * fac_ratio_cap
+
+    best_r, best_c, best_fac, best_dist = None, None, -1.0, float("inf")
+
+    for radius in range(0, max_radius_cells + 1):
+        # On radius 0 check the cell itself; on radius > 0 only the perimeter
+        candidates = (
+            [(row0, col0)]
+            if radius == 0
+            else [
+                (row0 + dr, col0 + dc)
+                for dr in range(-radius, radius + 1)
+                for dc in range(-radius, radius + 1)
+                if abs(dr) == radius or abs(dc) == radius
+            ]
+        )
+        for nr, nc in candidates:
+            if not (0 <= nr < nrows and 0 <= nc < ncols):
+                continue
+            fval = float(fac_arr[nr, nc])
+            if fac_nd is not None and fval == float(fac_nd):
+                continue
+            if fval < orig_fac:
+                continue   # must be at least as accumulated as our candidate
+            if fval > cap:
+                continue   # jumped to a higher-order stream — skip
+            dist = (nr - row0) ** 2 + (nc - col0) ** 2
+            if fval > best_fac or (fval == best_fac and dist < best_dist):
+                best_r, best_c, best_fac, best_dist = nr, nc, fval, dist
+
+        if best_r is not None and radius > 0:
+            break  # found a valid cell at this radius — stop expanding
+
+    if best_r is None:
+        # Nothing passed the cap — return original position
+        return orig_x, orig_y, orig_fac, False
+
+    snapped_x, snapped_y = rasterio.transform.xy(transform, best_r, best_c)
+    moved = (best_r != row0 or best_c != col0)
+    if moved:
+        dist_m = ((snapped_x - orig_x) ** 2 + (snapped_y - orig_y) ** 2) ** 0.5
+        logger.info(
+            f"    Snapped ({orig_x:.1f}, {orig_y:.1f}) FAC={orig_fac:,.0f} → "
+            f"({snapped_x:.1f}, {snapped_y:.1f}) FAC={best_fac:,.0f}  "
+            f"dist={dist_m:.0f} m"
+        )
+    return snapped_x, snapped_y, best_fac, moved
+
+
 def snap_pour_points_wbt(
     points_gdf: gpd.GeoDataFrame,
     fac_path: Path,
@@ -483,30 +562,51 @@ def snap_pour_points_wbt(
     temp_shp: Path,
     snapped_tif: Path,
     logger: logging.Logger,
+    fac_ratio_cap: float = 10.0,
 ) -> None:
     """
-    Snap pour points to the nearest high-accumulation stream cell using WBT's
-    own SnapPourPoints tool, then burn the result to a raster for Watershed.
+    Snap pour points to stream cells using a two-stage approach:
 
-    Using WBT's native vector snapping is more reliable than the numpy raster
-    approach because it avoids the int32/float64 dtype mismatch that causes
-    WBT Watershed to hang silently on some builds.
+    Stage 1 — WBT SnapPourPoints (fast, finds the nearest high-FAC cell).
+    Stage 2 — Cross-stream correction (new).  After WBT snapping, check each
+    point: if its FAC jumped by more than `fac_ratio_cap` times the original
+    candidate FAC it has crossed onto a higher-order trunk stream.  Those
+    points are re-snapped using a tributary-constrained numpy search that
+    stays within the same FAC magnitude range as the original candidate,
+    preventing the point from being hijacked by a nearby dominant channel.
 
-    snap_distance_cells * cell_size converts the cell-based snap distance to
-    map units, which is what WBT SnapPourPoints expects.
+    fac_ratio_cap=10 means a point is allowed to snap to a cell with up to
+    10× its original FAC (reasonable within-stream variation) but anything
+    larger is treated as a cross-stream jump and corrected.
     """
     snap_dist_m = snap_distance_cells * cell_size
 
     # Ensure pour points share the FAC raster CRS before writing to disk —
     # WBT will silently sample wrong cells if the CRS differs.
     with rasterio.open(fac_path) as src:
-        fac_crs = src.crs
+        fac_crs  = src.crs
+        fac_arr  = src.read(1).astype(np.float64)
+        fac_nd   = src.nodata
+        fac_tf   = src.transform
+    if fac_nd is not None:
+        fac_arr[fac_arr == fac_nd] = 0.0
+
     if points_gdf.crs and fac_crs and points_gdf.crs != fac_crs:
         logger.warning(
             f"  Reprojecting pour points to FAC CRS before SnapPourPoints "
             f"({points_gdf.crs.to_epsg()} -> {fac_crs.to_epsg()})"
         )
         points_gdf = points_gdf.to_crs(fac_crs)
+
+    # Sample the FAC at each original (pre-snap) candidate location so we
+    # can detect cross-stream jumps after WBT snapping.
+    orig_fac_vals = [
+        float(fac_arr[
+            max(0, min(int((~fac_tf * (g.x, g.y))[1]), fac_arr.shape[0] - 1)),
+            max(0, min(int((~fac_tf * (g.x, g.y))[0]), fac_arr.shape[1] - 1)),
+        ])
+        for g in points_gdf.geometry
+    ]
 
     # Write the pour points to a temporary shapefile for WBT
     points_gdf[["POUR_ID", "geometry"]].to_file(str(temp_shp))
@@ -537,7 +637,55 @@ def snap_pour_points_wbt(
         )
         snapped_gdf = gpd.read_file(str(temp_shp))
 
-    snapped_gdf["POUR_ID"] = range(1, len(snapped_gdf) + 1)
+    # ------------------------------------------------------------------
+    # Stage 2: cross-stream correction.
+    # For each point, compare its post-snap FAC to the original FAC.
+    # If the ratio exceeds fac_ratio_cap the point jumped to a different
+    # (higher-order) stream and needs to be re-snapped with the tributary-
+    # constrained numpy search.
+    # ------------------------------------------------------------------
+    corrected_geoms = []
+    n_corrected = 0
+    for i, row in snapped_gdf.iterrows():
+        g = row.geometry
+        snapped_col, snapped_row = ~fac_tf * (g.x, g.y)
+        snapped_row = max(0, min(int(snapped_row), fac_arr.shape[0] - 1))
+        snapped_col = max(0, min(int(snapped_col), fac_arr.shape[1] - 1))
+        snapped_fac = float(fac_arr[snapped_row, snapped_col])
+
+        orig_fac = orig_fac_vals[i] if i < len(orig_fac_vals) else snapped_fac
+        if orig_fac <= 0:
+            orig_fac = snapped_fac  # safety: can't compute ratio from zero
+
+        ratio = snapped_fac / orig_fac if orig_fac > 0 else 1.0
+        if ratio > fac_ratio_cap:
+            logger.warning(
+                f"  Pour point {i+1}: post-snap FAC={snapped_fac:,.0f} is "
+                f"{ratio:.1f}× original FAC={orig_fac:,.0f} — likely jumped "
+                f"to wrong stream. Re-snapping with tributary constraint..."
+            )
+            orig_pt = points_gdf.geometry.iloc[i] if i < len(points_gdf) else g
+            cx, cy, _, moved = _snap_single_point_numpy(
+                orig_pt.x, orig_pt.y, orig_fac,
+                fac_arr, fac_nd, fac_tf,
+                max_radius_cells=snap_distance_cells,
+                fac_ratio_cap=fac_ratio_cap,
+                logger=logger,
+            )
+            from shapely.geometry import Point as _Pt
+            corrected_geoms.append(_Pt(cx, cy))
+            if moved:
+                n_corrected += 1
+        else:
+            corrected_geoms.append(g)
+
+    if n_corrected:
+        logger.info(f"  Cross-stream correction applied to {n_corrected} pour point(s)")
+
+    snapped_gdf = snapped_gdf.copy()
+    snapped_gdf["geometry"] = corrected_geoms
+    snapped_gdf["POUR_ID"]  = range(1, len(snapped_gdf) + 1)
+
     logger.info(f"  Burning {len(snapped_gdf)} snapped pour point(s) to raster...")
     _points_to_raster(snapped_gdf, "POUR_ID", fac_path, snapped_tif)
     logger.info(f"  Snapped pour point raster written: {snapped_tif.name}")
