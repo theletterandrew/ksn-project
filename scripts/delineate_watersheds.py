@@ -245,30 +245,27 @@ def find_outlets_from_fac(
     fac_path: Path,
     fdr_path: Path,
     min_accum_cells: int,
-    min_sep_m: float,
     logger: logging.Logger,
-    max_trace_steps: int = 200,
 ) -> gpd.GeoDataFrame:
     """
-    Derive pour points directly from the FAC and FDR rasters, bypassing the
-    stream vector layer entirely.
+    Identify stream outlet (pour point) cells directly from the FAC and FDR
+    rasters using a single-step D8 downstream neighbour check.
 
-    A cell is treated as an outlet if it meets ALL of these criteria:
-      1. FAC >= min_accum_cells  (large enough drainage area)
-      2. It is a local FAC maximum within min_sep_m radius — vectorised with
-         scipy.ndimage.maximum_filter for speed at 2 m resolution.
-      3. Its D8 downstream path exits the raster OR drains into a nodata cell
-         within max_trace_steps steps.  One-step look-ahead is not enough for
-         clipped DEMs where streams may run parallel to the boundary for many
-         cells before exiting; tracing the full path catches these.
+    A cell is an outlet if and only if:
+      1. Its FAC >= min_accum_cells  (it is on a qualifying stream), AND
+      2. Its D8 downstream neighbour is NOT also a qualifying stream cell —
+         because the neighbour is outside the raster, is nodata, has FDR==0
+         (unroutable edge cell), or has FAC < min_accum_cells.
 
-    If criterion 3 yields no outlets (truly closed / internally-draining basin)
-    a loud warning is emitted and the function falls back to the single
-    highest-FAC local-maximum cell so the pipeline always produces at least one
-    watershed.  The caller should verify this result manually.
+    This is exact by definition: an outlet is simply the last cell of a stream
+    before it leaves the stream network.  No radius windows, no path tracing,
+    no distance deduplication, and no heuristics are required.
+
+    If no outlets are found (closed / internally-draining basin) a warning is
+    emitted and the single highest-FAC stream cell is returned as a fallback so
+    the pipeline always produces at least one watershed.
     """
     from rasterio.transform import xy as rio_xy
-    from scipy.ndimage import maximum_filter
 
     with rasterio.open(fac_path) as src:
         fac_arr      = src.read(1).astype(np.float64)
@@ -276,16 +273,16 @@ def find_outlets_from_fac(
         transform    = src.transform
         crs          = src.crs
         nrows, ncols = src.shape
-        cell_size    = abs(src.res[0])
 
     with rasterio.open(fdr_path) as src:
         fdr_arr = src.read(1)
         fdr_nd  = src.nodata
 
+    # Normalise nodata to 0 so threshold comparisons are clean
     if fac_nd is not None:
-        fac_arr[fac_arr == fac_nd] = 0
+        fac_arr[fac_arr == fac_nd] = 0.0
 
-    # WBT D8 pointer values and their (row, col) offsets
+    # WBT D8 pointer values → (row_offset, col_offset)
     D8_OFFSETS = {
         1:   ( 0,  1),   # E
         2:   ( 1,  1),   # SE
@@ -298,155 +295,88 @@ def find_outlets_from_fac(
     }
 
     # ------------------------------------------------------------------
-    # Criterion 1: cells above the accumulation threshold
+    # Build the stream mask: every cell with FAC >= threshold
     # ------------------------------------------------------------------
-    rows_above, cols_above = np.where(fac_arr >= min_accum_cells)
-    if len(rows_above) == 0:
+    stream_mask = fac_arr >= min_accum_cells
+    stream_rows, stream_cols = np.where(stream_mask)
+
+    if len(stream_rows) == 0:
         logger.error(
             f"No FAC cells >= {min_accum_cells:,}. "
             "Check MIN_WATERSHED_AREA in config.py."
         )
         return gpd.GeoDataFrame(geometry=[], crs=crs)
 
-    logger.info(f"  {len(rows_above):,} FAC cells >= {min_accum_cells:,} cells")
+    logger.info(f"  {len(stream_rows):,} stream cells at FAC >= {min_accum_cells:,}")
 
     # ------------------------------------------------------------------
-    # Criterion 2: deduplicate using a stream-aware spatial filter.
-    #
-    # The previous approach applied a single global maximum_filter window
-    # over the entire raster, which caused valid tributary outlets to be
-    # suppressed whenever a higher-FAC trunk cell happened to fall within
-    # the same window — even when the two streams are in separate valleys.
-    #
-    # Instead we:
-    #   (a) use maximum_filter only to flag locally-dominant cells (standard
-    #       local-max test), then
-    #   (b) apply a greedy distance-based deduplication pass that keeps the
-    #       highest-FAC cell first and drops any subsequent cell that is
-    #       closer than min_sep_m, regardless of stream membership.
-    #
-    # This preserves one outlet per tributary while still preventing
-    # duplicate near-coincident points on the same stream.
+    # Outlet test: a stream cell is an outlet when its single D8
+    # downstream neighbour is not also a stream cell.
     # ------------------------------------------------------------------
-    half_win     = max(1, int(min_sep_m / cell_size) // 4)  # tighter local window
-    window_size  = 2 * half_win + 1
-    logger.info(
-        f"  Local-max window: {window_size}x{window_size} cells "
-        f"({window_size * cell_size:.0f} m) — local dominance filter"
-    )
+    outlet_rows, outlet_cols = [], []
 
-    neighbourhood_max = maximum_filter(fac_arr, size=window_size, mode="constant", cval=0)
-    local_max_mask = (fac_arr >= min_accum_cells) & (fac_arr == neighbourhood_max)
+    for r, c in zip(stream_rows.tolist(), stream_cols.tolist()):
+        fdr_val = int(fdr_arr[r, c])
 
-    rows_lm, cols_lm = np.where(local_max_mask)
-    logger.info(f"  {len(rows_lm):,} local FAC maxima after local-dominance filter")
+        # FDR == 0 or nodata: cell cannot be routed further → outlet
+        if fdr_val == 0:
+            outlet_rows.append(r)
+            outlet_cols.append(c)
+            continue
+        if fdr_nd is not None and fdr_val == int(fdr_nd):
+            outlet_rows.append(r)
+            outlet_cols.append(c)
+            continue
 
-    # Greedy distance deduplication: sort by FAC descending, keep a candidate
-    # only if it is >= min_sep_m from every already-kept outlet.
-    if len(rows_lm) > 1:
-        xs_lm, ys_lm = rasterio.transform.xy(transform, rows_lm, cols_lm)
-        order = np.argsort([-fac_arr[r, c] for r, c in zip(rows_lm, cols_lm)])
-        kept_rows, kept_cols = [], []
-        kept_xy = []
-        for idx in order:
-            r, c = int(rows_lm[idx]), int(cols_lm[idx])
-            x, y = float(xs_lm[idx]), float(ys_lm[idx])
-            too_close = any(
-                (x - kx) ** 2 + (y - ky) ** 2 < min_sep_m ** 2
-                for kx, ky in kept_xy
-            )
-            if not too_close:
-                kept_rows.append(r)
-                kept_cols.append(c)
-                kept_xy.append((x, y))
-        rows_lm = np.array(kept_rows, dtype=rows_lm.dtype)
-        cols_lm = np.array(kept_cols, dtype=cols_lm.dtype)
-        logger.info(
-            f"  {len(rows_lm):,} candidates after distance deduplication "
-            f"(min_sep = {min_sep_m:.0f} m)"
-        )
+        offset = D8_OFFSETS.get(fdr_val)
+        if offset is None:
+            # Unexpected FDR value — treat conservatively as outlet
+            logger.warning(f"  Unexpected FDR value {fdr_val} at ({r}, {c}) — treating as outlet")
+            outlet_rows.append(r)
+            outlet_cols.append(c)
+            continue
+
+        nr, nc = r + offset[0], c + offset[1]
+
+        # Downstream cell is outside the raster → outlet
+        if not (0 <= nr < nrows and 0 <= nc < ncols):
+            outlet_rows.append(r)
+            outlet_cols.append(c)
+            continue
+
+        # Downstream cell is nodata → stream exits the study area → outlet
+        if fdr_nd is not None and int(fdr_arr[nr, nc]) == int(fdr_nd):
+            outlet_rows.append(r)
+            outlet_cols.append(c)
+            continue
+
+        # Downstream cell is below the stream threshold → end of stream → outlet
+        if not stream_mask[nr, nc]:
+            outlet_rows.append(r)
+            outlet_cols.append(c)
+            continue
+
+        # Downstream cell is also a stream cell → interior, not an outlet
+
+    logger.info(f"  {len(outlet_rows)} outlet cell(s) identified by D8 neighbour check")
 
     # ------------------------------------------------------------------
-    # Criterion 3: trace the full D8 downstream path.
-    # A candidate is a boundary outlet if its flow path exits the raster
-    # or reaches a nodata FDR cell within max_trace_steps steps.
-    # Tracing rather than one-step look-ahead handles streams that run
-    # parallel to the study-area edge for many cells before exiting.
+    # Fallback for closed / internally-draining basins
     # ------------------------------------------------------------------
-    def _traces_to_boundary(start_r: int, start_c: int) -> bool:
-        r, c = start_r, start_c
-        for _ in range(max_trace_steps):
-            fdr_val = int(fdr_arr[r, c])
-
-            # FDR == nodata at the *current* cell: this cell is outside the
-            # hydrologically conditioned area.  Treat as an outlet — the stream
-            # has already left the study area.
-            if fdr_nd is not None and fdr_val == int(fdr_nd):
-                return True
-
-            # FDR == 0: WBT marks edge / flat cells as 0.
-            # Accept unconditionally — if flow has been routed to a 0-FDR cell
-            # the path has nowhere further to go and should be treated as an
-            # outlet regardless of whether it sits on the strict raster edge.
-            if fdr_val == 0:
-                return True
-
-            offset = D8_OFFSETS.get(fdr_val)
-            if offset is None:
-                return False  # unexpected / corrupt FDR value
-
-            nr, nc = r + offset[0], c + offset[1]
-
-            # Path exits the raster extent
-            if not (0 <= nr < nrows and 0 <= nc < ncols):
-                return True
-
-            # Next cell is nodata — stream exits the conditioned area
-            if fdr_nd is not None and int(fdr_arr[nr, nc]) == int(fdr_nd):
-                return True
-
-            r, c = nr, nc
-
-        return False  # path stayed inside raster for all trace steps
-
-    logger.info(
-        f"  Tracing D8 paths (max {max_trace_steps} steps) "
-        f"for {len(rows_lm):,} candidates..."
-    )
-    boundary_outlets = [
-        (r, c)
-        for r, c in zip(rows_lm.tolist(), cols_lm.tolist())
-        if _traces_to_boundary(r, c)
-    ]
-
-    if boundary_outlets:
-        outlet_rows = [r for r, c in boundary_outlets]
-        outlet_cols = [c for r, c in boundary_outlets]
-        logger.info(f"  {len(outlet_rows)} boundary outlet(s) identified")
-    else:
-        # ------------------------------------------------------------------
-        # Closed-basin / internal-drainage fallback.
-        # Emit a conspicuous warning so the user knows this happened and can
-        # verify the result rather than silently accepting wrong pour points.
-        # ------------------------------------------------------------------
+    if not outlet_rows:
         logger.warning(
-            "  *** NO BOUNDARY OUTLETS FOUND after D8 path tracing. ***\n"
-            "  This usually means:\n"
-            "    (a) The DEM is a closed basin with no surface outlet, OR\n"
-            "    (b) max_trace_steps is too small for a long exit path — try "
-            f"increasing it beyond {max_trace_steps}, OR\n"
-            "    (c) The FDR raster has unresolved sinks near the boundary.\n"
-            "  Falling back to the single highest-FAC local-maximum cell.\n"
-            "  VERIFY the output pour point location before proceeding."
+            "  *** NO OUTLETS FOUND — no stream cell drains out of the stream network. ***\n"
+            "  This usually means the basin is internally draining or the FDR\n"
+            "  raster has unresolved sinks.  Falling back to the single\n"
+            "  highest-FAC stream cell.  VERIFY this location before proceeding."
         )
-        # Use only the single best cell to avoid producing a large number of
-        # spurious interior watersheds.
-        best_idx    = int(np.argmax([fac_arr[r, c] for r, c in zip(rows_lm, cols_lm)]))
-        outlet_rows = [int(rows_lm[best_idx])]
-        outlet_cols = [int(cols_lm[best_idx])]
+        best_idx     = int(np.argmax(fac_arr[stream_mask]))
+        best_flat    = np.where(stream_mask.ravel())[0][best_idx]
+        outlet_rows  = [int(best_flat // ncols)]
+        outlet_cols  = [int(best_flat  % ncols)]
 
     # ------------------------------------------------------------------
-    # Convert row/col indices to map coordinates
+    # Convert row/col indices to map coordinates and return
     # ------------------------------------------------------------------
     xs, ys = rio_xy(transform, outlet_rows, outlet_cols)
     points = [gpd.points_from_xy([x], [y])[0] for x, y in zip(xs, ys)]
@@ -1017,10 +947,8 @@ def main():
     # stream vector layer. The stream GeoPackage may only cover headwater
     # segments and never intersect the high-accumulation trunk cells, so
     # vector-based outlet detection is unreliable for full-DEM tiling.
-    min_sep_m = SNAP_DISTANCE * cell_w * 3  # minimum distance between outlets
-
     primary = find_outlets_from_fac(
-        fac_path, fdr_path, MIN_DRAINAGE_AREA_CELLS, min_sep_m, logger
+        fac_path, fdr_path, MIN_DRAINAGE_AREA_CELLS, logger
     )
 
     if primary.empty:
@@ -1034,8 +962,7 @@ def main():
     primary["POUR_ID"] = range(1, len(primary) + 1)
     logger.info(
         f"  {len(primary)} outlet(s) selected "
-        f"(FAC >= {MIN_DRAINAGE_AREA_CELLS:,} cells, "
-        f"min separation {min_sep_m:.0f} m)"
+        f"(FAC >= {MIN_DRAINAGE_AREA_CELLS:,} cells)"
     )
 
     # ------------------------------------------------------------------
