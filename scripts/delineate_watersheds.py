@@ -33,6 +33,7 @@ import subprocess
 import numpy as np
 import rasterio
 import rasterio.features
+import rasterio.transform
 import geopandas as gpd
 from shapely.geometry import shape as shapely_shape
 
@@ -199,11 +200,12 @@ def extract_stream_outlets(streams_gpkg: Path, fac_path: Path, sample_spacing_m:
             seg_ids.append(seg_idx)
             continue
 
-        # Interpolate at regular intervals plus both endpoints
-        n_steps   = max(1, int(length / sample_spacing_m))
-        distances = [i * length / n_steps for i in range(n_steps + 1)]
-        for d in distances:
-            pt = geom.interpolate(d)
+        # Sample both endpoints; the downstream end of a line is the one
+        # with the higher FAC value.  Interpolating the whole line and
+        # keeping the maximum FAC point incorrectly places the outlet at
+        # the high-accumulation trunk rather than the segment's mouth.
+        endpoints = [geom.interpolate(0.0), geom.interpolate(1.0)]
+        for pt in endpoints:
             cand_pts.append(pt)
             seg_ids.append(seg_idx)
 
@@ -215,7 +217,8 @@ def extract_stream_outlets(streams_gpkg: Path, fac_path: Path, sample_spacing_m:
         fac_vals = [v[0] for v in src.sample([(p.x, p.y) for p in cand_pts])]
 
     # ---------------------------------------------------------------
-    # For each segment keep the candidate with the highest valid FAC
+    # For each segment keep the endpoint with the HIGHER FAC value —
+    # that is the downstream (outlet) end of the segment.
     # ---------------------------------------------------------------
     n_segs      = len(streams)
     best_pt     = [None]    * n_segs
@@ -308,23 +311,60 @@ def find_outlets_from_fac(
     logger.info(f"  {len(rows_above):,} FAC cells >= {min_accum_cells:,} cells")
 
     # ------------------------------------------------------------------
-    # Criterion 2: local FAC maxima within min_sep_m radius.
-    # scipy maximum_filter replaces the slow Python cell-by-cell loop.
-    # A cell passes if it equals the neighbourhood maximum — i.e. no
-    # higher-FAC cell exists within the separation window.
+    # Criterion 2: deduplicate using a stream-aware spatial filter.
+    #
+    # The previous approach applied a single global maximum_filter window
+    # over the entire raster, which caused valid tributary outlets to be
+    # suppressed whenever a higher-FAC trunk cell happened to fall within
+    # the same window — even when the two streams are in separate valleys.
+    #
+    # Instead we:
+    #   (a) use maximum_filter only to flag locally-dominant cells (standard
+    #       local-max test), then
+    #   (b) apply a greedy distance-based deduplication pass that keeps the
+    #       highest-FAC cell first and drops any subsequent cell that is
+    #       closer than min_sep_m, regardless of stream membership.
+    #
+    # This preserves one outlet per tributary while still preventing
+    # duplicate near-coincident points on the same stream.
     # ------------------------------------------------------------------
-    half_win     = max(1, int(min_sep_m / cell_size))
+    half_win     = max(1, int(min_sep_m / cell_size) // 4)  # tighter local window
     window_size  = 2 * half_win + 1
     logger.info(
         f"  Local-max window: {window_size}x{window_size} cells "
-        f"({window_size * cell_size:.0f} m)"
+        f"({window_size * cell_size:.0f} m) — local dominance filter"
     )
 
     neighbourhood_max = maximum_filter(fac_arr, size=window_size, mode="constant", cval=0)
     local_max_mask = (fac_arr >= min_accum_cells) & (fac_arr == neighbourhood_max)
 
     rows_lm, cols_lm = np.where(local_max_mask)
-    logger.info(f"  {len(rows_lm):,} local FAC maxima after deduplication")
+    logger.info(f"  {len(rows_lm):,} local FAC maxima after local-dominance filter")
+
+    # Greedy distance deduplication: sort by FAC descending, keep a candidate
+    # only if it is >= min_sep_m from every already-kept outlet.
+    if len(rows_lm) > 1:
+        xs_lm, ys_lm = rasterio.transform.xy(transform, rows_lm, cols_lm)
+        order = np.argsort([-fac_arr[r, c] for r, c in zip(rows_lm, cols_lm)])
+        kept_rows, kept_cols = [], []
+        kept_xy = []
+        for idx in order:
+            r, c = int(rows_lm[idx]), int(cols_lm[idx])
+            x, y = float(xs_lm[idx]), float(ys_lm[idx])
+            too_close = any(
+                (x - kx) ** 2 + (y - ky) ** 2 < min_sep_m ** 2
+                for kx, ky in kept_xy
+            )
+            if not too_close:
+                kept_rows.append(r)
+                kept_cols.append(c)
+                kept_xy.append((x, y))
+        rows_lm = np.array(kept_rows, dtype=rows_lm.dtype)
+        cols_lm = np.array(kept_cols, dtype=cols_lm.dtype)
+        logger.info(
+            f"  {len(rows_lm):,} candidates after distance deduplication "
+            f"(min_sep = {min_sep_m:.0f} m)"
+        )
 
     # ------------------------------------------------------------------
     # Criterion 3: trace the full D8 downstream path.
@@ -338,19 +378,22 @@ def find_outlets_from_fac(
         for _ in range(max_trace_steps):
             fdr_val = int(fdr_arr[r, c])
 
-            # FDR == nodata: unresolvable cell — not a clean outlet
+            # FDR == nodata at the *current* cell: this cell is outside the
+            # hydrologically conditioned area.  Treat as an outlet — the stream
+            # has already left the study area.
             if fdr_nd is not None and fdr_val == int(fdr_nd):
-                return False
+                return True
 
-            # FDR == 0 on the raster edge: WBT couldn't route further —
-            # treat as boundary outlet
+            # FDR == 0: WBT marks edge / flat cells as 0.
+            # Accept unconditionally — if flow has been routed to a 0-FDR cell
+            # the path has nowhere further to go and should be treated as an
+            # outlet regardless of whether it sits on the strict raster edge.
             if fdr_val == 0:
-                on_edge = (r == 0 or r == nrows - 1 or c == 0 or c == ncols - 1)
-                return on_edge
+                return True
 
             offset = D8_OFFSETS.get(fdr_val)
             if offset is None:
-                return False  # unexpected FDR value
+                return False  # unexpected / corrupt FDR value
 
             nr, nc = r + offset[0], c + offset[1]
 
@@ -358,7 +401,7 @@ def find_outlets_from_fac(
             if not (0 <= nr < nrows and 0 <= nc < ncols):
                 return True
 
-            # Next cell is nodata (stream exits study area mid-raster)
+            # Next cell is nodata — stream exits the conditioned area
             if fdr_nd is not None and int(fdr_arr[nr, nc]) == int(fdr_nd):
                 return True
 
