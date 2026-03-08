@@ -370,184 +370,140 @@ def pixels_to_linestring(chain: list, transform) -> LineString:
 
 
 
-def extract_longest_branch(
-    lines: list,
-    fac_arr: np.ndarray,
-    adj: dict,
+def extract_main_stem(
+    stream_raster: Path,
+    fac_path: Path,
+    fdr_path: Path,
     out_path: Path,
     out_crs,
+    transform,
     logger: logging.Logger,
 ) -> None:
     """
-    Find the globally longest connected outlet->headwater path and write
-    those segments to *out_path*.
+    Use WhiteboxTools FindMainStem to identify the longest path from outlet
+    to headwater, then vectorize the result using rasterio/shapely.
 
-    We first build a directed upstream graph using segment topology:
-    segment j is upstream of segment i when j's mouth pixel touches i's
-    source pixel (exactly or as an 8-neighbour).
-
-    Then we compute the maximum cumulative length path in that directed
-    graph (dynamic programming on DFS). This returns the true longest
-    branch by geometry length, not merely the highest-FAC tributary.
+    Inputs:
+        stream_raster — binary stream raster (1=stream, 0/nodata=no stream)
+        fac_path      — flow accumulation raster
+        fdr_path      — flow direction raster (WBT native encoding)
+        out_path      — output GeoPackage path
+        out_crs       — CRS for output (WKT string)
+        transform     — rasterio affine transform for pixel->coord conversion
     """
-    if not lines:
-        logger.warning("  No segments available for longest-branch extraction.")
+    if not stream_raster.exists():
+        logger.warning("  Stream raster not found — skipping main stem extraction.")
         return
 
-    logger.info("Step 7: Extracting longest mouth->headwater branch...")
+    logger.info("  Step 9: Extracting main stem using WBT FindMainStem...")
 
-    # Build lookup of segment mouths. Multiple segments can share a mouth
-    # pixel at a junction, so this is one-to-many.
-    mouth_to_seg_indices = defaultdict(list)
-    for i, (seg, _) in enumerate(lines):
-        mouth_to_seg_indices[seg[0]].append(i)
+    main_stem_raster = stream_raster.parent / "main_stem.tif"
 
-    # For each segment, find tributaries that connect at its SOURCE end.
-    # Because segments are ordered mouth->source, walking upstream means
-    # stepping from current source to segments whose mouth is that source.
-    #
-    # We accept both exact pixel matches and 8-neighbour matches to be robust
-    # to tiny skeletonization artifacts around confluences.
-    seg_upstream = defaultdict(list)
-    for i, (seg_i, _) in enumerate(lines):
-        source_i = seg_i[-1]
-        candidate_mouths = {source_i} | set(adj.get(source_i, []))
-        for mouth_px in candidate_mouths:
-            for j in mouth_to_seg_indices.get(mouth_px, []):
-                if j != i:
-                    seg_upstream[i].append(j)
-        if seg_upstream[i]:
-            seg_upstream[i] = sorted(set(seg_upstream[i]))
-    # --- after the seg_upstream construction loop ---
+    success = run_wbt("FindMainStem", {
+        "d8_pntr": str(fdr_path),
+        "streams": str(stream_raster),
+        "output":  str(main_stem_raster),
+    }, logger)
 
-    # Break bidirectional (mutual) links at junctions.
-    # If i lists j as upstream AND j lists i as upstream, the shorter
-    # segment is the tributary; remove the link that points the wrong way.
-    for i in list(seg_upstream.keys()):
-        for j in list(seg_upstream[i]):
-            if i in seg_upstream.get(j, []):
-                # Mutual link — keep the direction where the downstream
-                # segment is longer (higher FAC at mouth is a proxy).
-                fac_i = float(fac_arr[lines[i][0][0][0], lines[i][0][0][1]])
-                fac_j = float(fac_arr[lines[j][0][0][0], lines[j][0][0][1]])
-                if fac_i >= fac_j:
-                    # i is more downstream → j should NOT list i as upstream
-                    seg_upstream[j] = [k for k in seg_upstream[j] if k != i]
-                else:
-                    # j is more downstream → i should NOT list j as upstream
-                    seg_upstream[i] = [k for k in seg_upstream[i] if k != j]
-    # Note: we intentionally keep ALL upstream candidates for each segment.
-    # best_upstream_path() explores all branches recursively and picks the
-    # longest by geometry — pruning to highest-FAC here would prevent it
-    # from finding the true longest path when a lower-FAC branch is longer.
-    seg_lengths = [line.length for _, line in lines]
-    memo = {}
-
-    def best_upstream_path(seg_idx, active):
-        # Returns (total_length_from_seg_to_best_headwater, [path indices]).
-        if seg_idx in memo:
-            return memo[seg_idx]
-        if seg_idx in active:
-            # Safety against rare topology cycles.
-            return seg_lengths[seg_idx], [seg_idx]
-
-        active.add(seg_idx)
-        best_total = seg_lengths[seg_idx]
-        best_path = [seg_idx]
-
-        for up_idx in seg_upstream.get(seg_idx, []):
-            up_total, up_path = best_upstream_path(up_idx, active)
-            candidate_total = seg_lengths[seg_idx] + up_total
-            if candidate_total > best_total:
-                best_total = candidate_total
-                best_path = [seg_idx] + up_path
-            elif np.isclose(candidate_total, best_total):
-                # Tie-breaker: prefer branch with higher upstream mouth FAC.
-                cand_fac = float(fac_arr[lines[up_idx][0][0][0], lines[up_idx][0][0][1]])
-                curr_next = best_path[1] if len(best_path) > 1 else None
-                curr_fac = float("-inf")
-                if curr_next is not None:
-                    curr_fac = float(fac_arr[lines[curr_next][0][0][0], lines[curr_next][0][0][1]])
-                if cand_fac > curr_fac:
-                    best_path = [seg_idx] + up_path
-
-        active.remove(seg_idx)
-        memo[seg_idx] = (best_total, best_path)
-        return memo[seg_idx]
-
-    # Evaluate all possible downstream starts (supports multi-outlet networks)
-    # and pick the globally longest connected branch.
-    best_total = -1.0
-    path_indices = []
-    downstream_start_idx = None
-    # Identify the true basin outlet as the single segment with the highest
-    # FAC at its mouth.  In a properly delineated basin there is exactly one
-    # outlet and it always has the greatest accumulated drainage area.  Using
-    # FAC directly is more robust than topological heuristics (e.g. "mouth not
-    # in any source set") which can fail when the main stem outlet is trimmed
-    # by the border or length filters.
-    true_outlet_idx = max(
-        range(len(lines)),
-        key=lambda i: float(fac_arr[lines[i][0][0][0], lines[i][0][0][1]])
-    )
-    logger.info(
-        f"  True outlet: seg[{true_outlet_idx}] "
-        f"mouth={lines[true_outlet_idx][0][0]} "
-        f"FAC={float(fac_arr[lines[true_outlet_idx][0][0][0], lines[true_outlet_idx][0][0][1]]):.0f}"
-    )
-
-    # Start the longest-path search from the true outlet only.
-    best_total, path_indices = best_upstream_path(true_outlet_idx, set())
-    downstream_start_idx = true_outlet_idx
-
-    if downstream_start_idx is None or not path_indices:
-        logger.warning("  Could not determine a valid longest branch path.")
+    if not success or not main_stem_raster.exists():
+        logger.error("  FindMainStem failed — skipping main stem extraction.")
         return
 
-    # Log the selected downstream start using the correct variable name.
-    start_fac = float(fac_arr[lines[downstream_start_idx][0][0][0], lines[downstream_start_idx][0][0][1]])
-    logger.info(
-        f"  Selected downstream start: seg[{downstream_start_idx}] "
-        f"mouth={lines[downstream_start_idx][0][0]} FAC={start_fac:.0f} "
-        f"upstream_segs={seg_upstream.get(downstream_start_idx, [])}"
-    )
-    logger.info(
-        f"  Longest path: {best_total:.1f} m  ({best_total/1000:.2f} km)"
-        f"  |  {len(path_indices)} segments  outlet->headwater"
-    )
+    # Vectorize the main stem raster using rasterio/shapely
+    logger.info("  Vectorizing main stem raster...")
+    try:
+        with rasterio.open(str(main_stem_raster)) as src:
+            data    = src.read(1)
+            nodata  = src.nodata
+            ms_transform = src.transform
 
-    schema = {
-        "geometry": "LineString",
-        "properties": {
-            "seg_id":      "int",
-            "order_along": "int",
-            "length_m":    "float",
-            "n_vertices":  "int",
-        },
-    }
+        # Main stem pixels have value 1
+        main_stem_mask = (data == 1)
+        pixel_count = int(main_stem_mask.sum())
+        logger.info(f"  Main stem pixels: {pixel_count:,}")
 
-    if out_path.exists():
-        out_path.unlink()
-    for order, idx in enumerate(path_indices, start=1):
-        seg, line = lines[idx]
-        logger.info(f"  path seg[{idx}] order={order} mouth={seg[0]} source={seg[-1]} len={line.length:.1f}m")
-    with fiona.open(
-        str(out_path), mode="w", driver="GPKG",
-        schema=schema, crs=out_crs, layer="longest_branch",
-    ) as dst:
-        for order, idx in enumerate(path_indices, start=1):
-            seg, line = lines[idx]
+        if pixel_count == 0:
+            logger.warning("  No main stem pixels found in output raster.")
+            return
+
+        # Trace pixel chain from the main stem mask using 8-connectivity.
+        # Walk from the outlet (highest FAC pixel) to headwater.
+        with rasterio.open(str(fac_path)) as _src:
+            fac_arr = _src.read(1).astype(np.float32)
+
+        rows, cols = np.where(main_stem_mask)
+        stem_pixels = set(zip(rows.tolist(), cols.tolist()))
+
+        # Find outlet: main stem pixel with highest FAC
+        outlet = max(stem_pixels, key=lambda rc: float(fac_arr[rc[0], rc[1]]))
+
+        # Walk upstream pixel by pixel following highest FAC neighbour
+        # that is also on the main stem
+        chain = [outlet]
+        visited = {outlet}
+        current = outlet
+        while True:
+            r, c = current
+            best_next = None
+            best_fac = -1.0
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    if dr == 0 and dc == 0:
+                        continue
+                    nb = (r + dr, c + dc)
+                    if nb in stem_pixels and nb not in visited:
+                        nb_fac = float(fac_arr[nb[0], nb[1]])
+                        # Walk upstream = decreasing FAC
+                        if nb_fac < float(fac_arr[r, c]) and nb_fac > best_fac:
+                            best_fac = nb_fac
+                            best_next = nb
+            if best_next is None:
+                break
+            chain.append(best_next)
+            visited.add(best_next)
+            current = best_next
+
+        logger.info(f"  Main stem chain length: {len(chain):,} pixels")
+
+        # Convert pixel chain to LineString
+        coords = [
+            (ms_transform.c + (c + 0.5) * ms_transform.a,
+             ms_transform.f + (r + 0.5) * ms_transform.e)
+            for r, c in chain
+        ]
+        line = LineString(coords)
+        logger.info(f"  Main stem length: {line.length:.1f} m  ({line.length/1000:.2f} km)")
+
+        schema = {
+            "geometry": "LineString",
+            "properties": {
+                "length_m":   "float",
+                "n_vertices": "int",
+            },
+        }
+
+        if out_path.exists():
+            out_path.unlink()
+
+        with fiona.open(
+            str(out_path), mode="w", driver="GPKG",
+            schema=schema, crs=out_crs, layer="main_stem",
+        ) as dst:
             dst.write({
                 "geometry": mapping(line),
                 "properties": {
-                    "seg_id":      idx + 1,
-                    "order_along": order,
-                    "length_m":    round(line.length, 2),
-                    "n_vertices":  len(seg),
+                    "length_m":   round(line.length, 2),
+                    "n_vertices": len(chain),
                 },
             })
 
-    logger.info(f"  Written to: {out_path}")
+        logger.info(f"  Written to: {out_path}")
+
+    finally:
+        # Clean up intermediate main stem raster
+        if main_stem_raster.exists():
+            main_stem_raster.unlink()
+            logger.info(f"  Deleted intermediate raster: {main_stem_raster.name}")
 
 
 def run_wbt(tool: str, args: dict, logger: logging.Logger) -> bool:
@@ -605,10 +561,11 @@ def extract_streams_for_basin(
     """
     basin_dir.mkdir(parents=True, exist_ok=True)
 
-    fdr_path = basin_dir / "fdr.tif"
-    fac_path = basin_dir / "fac.tif"
-    out_path = basin_dir / "streams_connected.gpkg"
-    out_longest_path = basin_dir / "streams_longest_branch.gpkg"
+    fdr_path        = basin_dir / "fdr.tif"
+    fac_path        = basin_dir / "fac.tif"
+    stream_raster   = basin_dir / "streams_raster.tif"
+    out_path        = basin_dir / "streams_connected.gpkg"
+    out_main_stem   = basin_dir / "main_stem.gpkg"
 
     start_time = time.time()
 
@@ -661,6 +618,20 @@ def extract_streams_for_basin(
         if pixel_count == 0:
             logger.error("  No stream pixels at this threshold — skipping basin.")
             return False
+
+        # Save stream mask as raster for FindMainStem
+        stream_meta = {
+            "driver":    "GTiff",
+            "dtype":     "uint8",
+            "width":     stream_mask.shape[1],
+            "height":    stream_mask.shape[0],
+            "count":     1,
+            "crs":       crs,
+            "transform": transform,
+            "nodata":    0,
+        }
+        with rasterio.open(str(stream_raster), "w", **stream_meta) as dst:
+            dst.write(stream_mask.astype(np.uint8), 1)
 
         # ── Step 4: Read FDR ───────────────────────────────────────────────────
         logger.info("  Step 4: Reading FDR raster...")
@@ -829,24 +800,25 @@ def extract_streams_for_basin(
             if batch:
                 dst.writerecords(batch)
 
-        # ── Step 9: Longest branch (optional) ─────────────────────────────────
+        # ── Step 9: Main stem via FindMainStem (optional) ────────────────────
         if EXTRACT_LONGEST_BRANCH:
-            with rasterio.open(str(fac_path)) as _src:
-                fac_arr_full = _src.read(1).astype(np.float32)
-            extract_longest_branch(lines, fac_arr_full, adj, out_longest_path, out_crs, logger)
-            del fac_arr_full
+            extract_main_stem(
+                stream_raster, fac_path, fdr_path,
+                out_main_stem, out_crs, transform, logger
+            )
 
-        # ── Cleanup: delete intermediate FDR ──────────────────────────────────
-        if fdr_path.exists():
-            fdr_path.unlink()
-            logger.info(f"  Deleted intermediate FDR: {fdr_path.name}")
+        # ── Cleanup: delete intermediate FDR and stream raster ────────────────
+        for tmp in (fdr_path, stream_raster):
+            if tmp.exists():
+                tmp.unlink()
+                logger.info(f"  Deleted intermediate file: {tmp.name}")
 
         elapsed = time.time() - start_time
         logger.info(f"  Done — {count:,} segments in {elapsed / 60:.1f} min")
-        logger.info(f"  Streams : {out_path}")
-        logger.info(f"  FAC     : {fac_path}")
+        logger.info(f"  Streams   : {out_path}")
+        logger.info(f"  FAC       : {fac_path}")
         if EXTRACT_LONGEST_BRANCH:
-            logger.info(f"  Longest : {out_longest_path}")
+            logger.info(f"  Main stem : {out_main_stem}")
 
         return True
 
