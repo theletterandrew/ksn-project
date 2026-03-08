@@ -89,7 +89,7 @@ MIN_PIXELS = 10
 
 # Number of border cells to blank on all four edges before thresholding.
 # Edge cells drain off-raster in D8, accumulating spurious flow.
-BORDER_CELLS = 3
+BORDER_CELLS = 0
 
 # Determines whether or not stream extraction script extracts the longest branch or not
 EXTRACT_LONGEST_BRANCH = True
