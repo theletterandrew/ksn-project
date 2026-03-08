@@ -38,7 +38,7 @@ SCRIPTS_TO_RUN = [
     # "mosaic_dem.py",
     # "wbt_hydrology.py",
     # "delineate_and_clip_basins.py",
-    "stream_extraction_wbt.py",
+    "topotoolbox_streams.py",
     # "extract_longest_branches.py",
     # "calculate_ksn.py",
     # "plot_stream_profiles.py"
