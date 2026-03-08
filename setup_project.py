@@ -29,6 +29,7 @@ def run_setup():
         config.DATA_SCRATCH_WATERSHEDS,
         config.DATA_STREAMS,
         config.DATA_WATERSHEDS,
+        config.DATA_BASINS,
         config.DATA_KSN,
         config.FIGURES_DIR
     ]
