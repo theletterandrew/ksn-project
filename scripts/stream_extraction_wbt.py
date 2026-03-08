@@ -1,28 +1,28 @@
 """
 stream_extraction_wbt.py
 ------------------------
-Extracts a fully connected stream network from WhiteboxTools flow
-accumulation and flow direction outputs. Produces a GeoPackage of
-ordered LineString features (mouth->source) suitable for ksn analysis
-and watershed delineation.
+Extracts a fully connected stream network for each drainage basin produced
+by delineate_and_clip_basins.py. For each basin:
 
-Pipeline:
-  1. Threshold the FAC raster to a binary stream mask
-  2. Skeletonize the mask to 1-pixel-wide centrelines (scikit-image)
-  3. Trace each centreline pixel-chain into a LineString, ordered
+  1. Re-compute D8 flow direction (FDR) from the clipped basin DEM
+  2. Re-compute flow accumulation (FAC) from the basin FDR — kept as output
+  3. Threshold the FAC raster to a binary stream mask
+  4. Skeletonize the mask to 1-pixel-wide centrelines (scikit-image)
+  5. Trace each centreline pixel-chain into a LineString, ordered
      mouth->source using the FDR raster so downstream ends are always
      at index 0
-  4. Collapse junction-pixel clusters from skeletonization artifacts
+  6. Collapse junction-pixel clusters from skeletonization artifacts
      so every branch point is a single node
-  5. Write the full network to streams_connected.gpkg
-  6. Optionally extract the longest outlet-to-headwater path and write
-     it to streams_longest_branch.gpkg (set EXTRACT_LONGEST_BRANCH=True)
+  7. Write the stream network to basin_XXXX/streams_connected.gpkg
+  8. Optionally extract the longest outlet-to-headwater path and write
+     it to basin_XXXX/streams_longest_branch.gpkg
+  9. Delete the intermediate per-basin FDR (FAC is kept for Ksn/CHI)
 
 USAGE:
     1. Install dependencies:
        pip install rasterio numpy fiona shapely scikit-image networkx
 
-    2. Edit the paths and threshold in the CONFIG section below.
+    2. Run delineate_and_clip_basins.py first to produce per-basin DEMs.
 
     3. Run:
        python stream_extraction_wbt.py
@@ -34,10 +34,12 @@ Requirements:
     - shapely
     - scikit-image  (for skeletonize)
     - networkx      (for segment merging)
-    - Completed wbt_hydrology.py first (produces FAC + FDR rasters)
+    - WhiteboxTools executable at config.WBT_EXE
+    - Completed delineate_and_clip_basins.py first (produces basin DEMs)
 """
 
 import logging
+import subprocess
 import sys
 import time
 from collections import defaultdict, deque
@@ -63,12 +65,8 @@ import config
 # CONFIG — Edit these before running
 # =============================================================================
 
-WBT_DIR     = config.DATA_SCRATCH_WBT
-OUTPUT_DIR  = config.DATA_STREAMS
-
-FAC_FILE    = "flow_accumulation.tif"
-FDR_FILE    = "flow_direction.tif"
-OUTPUT_FILE = "streams_connected.gpkg"
+WBT_EXE    = config.WBT_EXE
+BASINS_DIR = Path(config.DATA_SCRATCH_WBT) / "basins"  # Output of delineate_and_clip_basins.py
 
 # Drainage area threshold (cells). At 2 m resolution:
 #   500,000  cells = ~2 km²
@@ -78,11 +76,10 @@ THRESHOLD = config.STREAM_THRESHOLD
 
 # Minimum number of skeleton pixels a segment must contain to be written.
 # Removes single-pixel stubs and short noise branches.
-MIN_PIXELS = 10
+MIN_PIXELS = config.MIN_PIXELS
 
 # Minimum stream length in metres. Segments shorter than this are dropped
 # after conversion to LineStrings (threshold is in real map units, not pixels).
-# Set in config.py as MIN_STREAM_LENGTH_M.
 MIN_STREAM_LENGTH_M = config.MIN_STREAM_LENGTH_M
 
 # Number of border cells to blank on all four edges before thresholding.
@@ -95,7 +92,6 @@ BORDER_CELLS = config.BORDER_CELLS
 # save it as a separate GeoPackage.  Useful for ksn profile extraction along
 # the main stem.  Uses a double-BFS on the segment graph so it runs in O(N).
 EXTRACT_LONGEST_BRANCH = getattr(config, "EXTRACT_LONGEST_BRANCH", True)
-LONGEST_BRANCH_FILE    = "streams_longest_branch.gpkg"
 
 # =============================================================================
 # END CONFIG — No edits needed below this line
@@ -116,19 +112,6 @@ D8_OFFSETS = {
 # Reverse: for each (dr, dc) what FDR value points in that direction
 D8_FROM_OFFSET = {v: k for k, v in D8_OFFSETS.items()}
 
-
-def setup_logging(output_dir: Path) -> logging.Logger:
-    log_path = output_dir / "stream_extraction_wbt.log"
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s  %(levelname)-8s  %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[
-            logging.FileHandler(log_path),
-            logging.StreamHandler(sys.stdout),
-        ],
-    )
-    return logging.getLogger(__name__)
 
 
 def skeletonize_stream_mask(stream_mask: np.ndarray, logger: logging.Logger) -> np.ndarray:
@@ -590,37 +573,93 @@ def extract_longest_branch(
     logger.info(f"  Written to: {out_path}")
 
 
-def main():
-    wbt_dir    = Path(WBT_DIR)
-    output_dir = Path(OUTPUT_DIR)
-    output_dir.mkdir(parents=True, exist_ok=True)
+def run_wbt(tool: str, args: dict, logger: logging.Logger) -> bool:
+    """
+    Runs a WhiteboxTools command. Returns True on success.
+    args is a dict of parameter name -> value.
+    """
+    cmd = [str(WBT_EXE), f"--run={tool}"]
+    for key, val in args.items():
+        cmd.append(f"--{key}={val}")
+    logger.info(f"Running: {tool}")
+    logger.info(f"Command: {' '.join(cmd)}")
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        if result.stdout:
+            for line in result.stdout.strip().splitlines():
+                logger.info(f"  WBT: {line}")
+        if result.stderr:
+            for line in result.stderr.strip().splitlines():
+                logger.warning(f"  WBT ERR: {line}")
+        if result.returncode != 0:
+            logger.error(f"{tool} failed with return code {result.returncode}")
+            return False
+        return True
+    except Exception as e:
+        logger.error(f"Failed to run {tool}: {e}")
+        return False
 
-    logger = setup_logging(output_dir)
 
-    fac_path         = wbt_dir    / FAC_FILE
-    fdr_path         = wbt_dir    / FDR_FILE
-    out_path         = output_dir / OUTPUT_FILE
-    out_longest_path = output_dir / LONGEST_BRANCH_FILE
+def extract_streams_for_basin(
+    basin_dem: Path,
+    basin_dir: Path,
+    logger: logging.Logger
+) -> bool:
+    """
+    Run the full stream extraction pipeline for a single basin.
+    Returns True on success, False on failure.
 
-    for label, p in [("FAC", fac_path), ("FDR", fdr_path)]:
-        if not p.exists():
-            logger.error(f"{label} raster not found: {p}")
-            logger.error("Run wbt_hydrology.py first.")
-            sys.exit(1)
+    Inputs:
+        basin_dem  — clipped basin DEM (e.g. basin_0001.tif)
+        basin_dir  — output directory for this basin
 
-    logger.info(f"Threshold        : {THRESHOLD:,} cells (~{THRESHOLD * 4 / 1e6:.1f} km² at 2m)")
-    logger.info(f"Min pixels       : {MIN_PIXELS}")
-    logger.info(f"Min stream length: {MIN_STREAM_LENGTH_M} m")
-    logger.info(f"Border cells     : {BORDER_CELLS}")
-    logger.info("-" * 60)
+    Outputs (written to basin_dir):
+        fac.tif                   — flow accumulation (kept for Ksn/CHI)
+        streams_connected.gpkg    — full stream network
+        streams_longest_branch.gpkg — longest path (if EXTRACT_LONGEST_BRANCH)
+
+    Intermediates (deleted after use):
+        fdr.tif                   — per-basin flow direction
+    """
+    basin_dir.mkdir(parents=True, exist_ok=True)
+
+    fdr_path = basin_dir / "fdr.tif"
+    fac_path = basin_dir / "fac.tif"
+    out_path = basin_dir / "streams_connected.gpkg"
+    out_longest_path = basin_dir / "streams_longest_branch.gpkg"
 
     start_time = time.time()
 
     try:
-        # ------------------------------------------------------------------
-        # Step 1: Read FAC, apply threshold
-        # ------------------------------------------------------------------
-        logger.info("Step 1: Reading FAC raster and applying threshold...")
+        # ── Step 1: Compute per-basin FDR ─────────────────────────────────────
+        logger.info("  Step 1: Computing per-basin flow direction...")
+        success = run_wbt("D8Pointer", {
+            "dem":    str(basin_dem),
+            "output": str(fdr_path),
+        }, logger)
+        if not success:
+            logger.error("  D8Pointer failed — skipping basin.")
+            return False
+
+        # ── Step 2: Compute per-basin FAC ─────────────────────────────────────
+        logger.info("  Step 2: Computing per-basin flow accumulation...")
+        success = run_wbt("D8FlowAccumulation", {
+            "input":    str(fdr_path),
+            "output":   str(fac_path),
+            "out_type": "cells",
+            "pntr":     "true",
+        }, logger)
+        if not success:
+            logger.error("  D8FlowAccumulation failed — skipping basin.")
+            return False
+
+        # ── Step 3: Threshold FAC to stream mask ──────────────────────────────
+        logger.info("  Step 3: Thresholding FAC to stream mask...")
         with rasterio.open(str(fac_path)) as src:
             fac_data  = src.read(1).astype(np.float32)
             transform = src.transform
@@ -630,15 +669,12 @@ def main():
         valid_mask  = (fac_data != nodata) if nodata is not None else np.ones_like(fac_data, dtype=bool)
         stream_mask = (fac_data >= THRESHOLD) & valid_mask
 
-        # FIX 1: Blank the raster border before thresholding.
-        # Edge cells drain "off the raster" in D8 routing and accumulate
-        # spurious flow, producing false streams along the DEM boundary.
         if BORDER_CELLS > 0:
             b = BORDER_CELLS
-            stream_mask[:b,  :] = False   # top
-            stream_mask[-b:, :] = False   # bottom
-            stream_mask[:,  :b] = False   # left
-            stream_mask[:, -b:] = False   # right
+            stream_mask[:b,  :] = False
+            stream_mask[-b:, :] = False
+            stream_mask[:,  :b] = False
+            stream_mask[:, -b:] = False
             logger.info(f"  Blanked {b}-cell border to suppress edge artifacts")
 
         pixel_count = int(stream_mask.sum())
@@ -646,35 +682,24 @@ def main():
         del fac_data, valid_mask
 
         if pixel_count == 0:
-            logger.error("No stream pixels at this threshold. Lower THRESHOLD in config.py.")
-            sys.exit(1)
+            logger.error("  No stream pixels at this threshold — skipping basin.")
+            return False
 
-        # ------------------------------------------------------------------
-        # Step 2: Read FDR raster
-        # ------------------------------------------------------------------
-        logger.info("Step 2: Reading FDR raster...")
+        # ── Step 4: Read FDR ───────────────────────────────────────────────────
+        logger.info("  Step 4: Reading FDR raster...")
         with rasterio.open(str(fdr_path)) as src:
             fdr_arr    = src.read(1)
             fdr_nodata = src.nodata
 
-        # ------------------------------------------------------------------
-        # Step 3: Skeletonize
-        # ------------------------------------------------------------------
-        logger.info("Step 3: Skeletonizing stream mask...")
-        skeleton    = skeletonize_stream_mask(stream_mask, logger)
+        # ── Step 5: Skeletonize ────────────────────────────────────────────────
+        logger.info("  Step 5: Skeletonizing stream mask...")
+        skeleton = skeletonize_stream_mask(stream_mask, logger)
         del stream_mask
 
-        # ------------------------------------------------------------------
-        # Step 4: Build adjacency graph and trace segments
-        # ------------------------------------------------------------------
-        logger.info("Step 4: Tracing skeleton into line segments...")
+        # ── Step 6: Build adjacency graph and trace segments ──────────────────
+        logger.info("  Step 6: Tracing skeleton into line segments...")
         adj = build_adjacency(skeleton)
 
-        # Collapse junction-pixel clusters produced by skeletonization.
-        # Morphological thinning often leaves 2-4 mutually-adjacent pixels at
-        # branch points instead of a single node, creating spurious 2-3 px
-        # segments that fragment the network.  Collapsing them first ensures
-        # every branch point is represented by exactly one pixel.
         junc_before = sum(1 for nbrs in adj.values() if len(nbrs) >= 3)
         adj, junction_remap = collapse_junction_clusters(adj)
         junc_after  = sum(1 for nbrs in adj.values() if len(nbrs) >= 3)
@@ -685,11 +710,6 @@ def main():
 
         segments = trace_segments(adj)
 
-        # Apply the junction remap to every pixel chain so that segment
-        # endpoints use the canonical representative pixel, not the original
-        # pre-collapse pixel.  Without this, seg[0]/seg[-1] won't match the
-        # corresponding endpoint of the adjacent segment, fragmenting the
-        # directed graph used for longest-branch extraction.
         if junction_remap:
             segments = [
                 [junction_remap.get(px, px) for px in chain]
@@ -697,10 +717,6 @@ def main():
             ]
         logger.info(f"  Raw segments traced: {len(segments):,}")
 
-        # Filter short stubs — but protect segments that connect two junction
-        # pixels, since dropping them breaks network topology regardless of length.
-        # A segment is a connector if BOTH endpoints are junction pixels
-        # (degree >= 3 in the collapsed adjacency graph).
         junction_pixels = {n for n, nbrs in adj.items() if len(nbrs) >= 3}
         kept_segs, dropped_stubs, protected_connectors = [], 0, 0
         for s in segments:
@@ -718,27 +734,16 @@ def main():
         )
 
         if not segments:
-            logger.error(
-                "No segments survived the minimum pixel filter. "
-                "Lower MIN_PIXELS or THRESHOLD."
-            )
-            sys.exit(1)
+            logger.error("  No segments survived the minimum pixel filter — skipping basin.")
+            return False
 
-        # ------------------------------------------------------------------
-        # Step 5: Orient each segment mouth->source using FAC
-        # ------------------------------------------------------------------
-        logger.info("Step 5: Orienting segments mouth->source using FAC...")
-        # Re-read FAC for orientation (fac_data was freed after Step 1 to
-        # save memory; we only need it briefly here and in Step 7)
+        # ── Step 7: Orient segments mouth->source ─────────────────────────────
+        logger.info("  Step 7: Orienting segments mouth->source using FAC...")
         with rasterio.open(str(fac_path)) as _src:
             fac_arr_orient = _src.read(1).astype(np.float32)
         segments = [order_segment_by_fac(s, fac_arr_orient) for s in segments]
         del fac_arr_orient
 
-        # FIX 2: Remove segments whose downstream end drains off the raster
-        # edge — but ONLY if they are not junction connectors (both endpoints
-        # are junction pixels).  Removing a connector that happens to exit the
-        # edge would break network topology.
         junction_pixels_set = {n for n, nbrs in adj.items() if len(nbrs) >= 3}
         before = len(segments)
         kept_drain = []
@@ -753,17 +758,11 @@ def main():
         logger.info(f"  Segments after edge-drain filter: {len(segments):,}")
 
         if not segments:
-            logger.error(
-                "No segments survived the edge-drain filter. "
-                "Your study area may legitimately drain off all edges — "
-                "set BORDER_CELLS = 0 and re-run if this is expected."
-            )
-            sys.exit(1)
+            logger.error("  No segments survived the edge-drain filter — skipping basin.")
+            return False
 
-        # ------------------------------------------------------------------
-        # Step 6: Convert to LineStrings and write GeoPackage
-        # ------------------------------------------------------------------
-        logger.info("Step 6: Writing LineStrings to GeoPackage...")
+        # ── Step 8: Convert to LineStrings and write GeoPackage ───────────────
+        logger.info("  Step 8: Writing LineStrings to GeoPackage...")
 
         schema = {
             "geometry": "LineString",
@@ -778,25 +777,14 @@ def main():
         if out_path.exists():
             out_path.unlink()
 
-        # Convert all segments to LineStrings
         lines = []
         for seg in segments:
             line = pixels_to_linestring(seg, transform)
             if line.length > 0:
                 lines.append((seg, line))
 
-        # Apply length filter — but ONLY to headwater stubs (segments whose
-        # upstream end has no further upstream neighbours).  Connector segments
-        # that link two other segments must never be dropped regardless of
-        # length, otherwise the network fragments into disconnected pieces and
-        # the longest-branch graph loses its outlet nodes.
         if MIN_STREAM_LENGTH_M > 0:
-            # Build a set of all pixels that appear as the MOUTH end of any
-            # segment — i.e. pixels something drains into.  A segment whose
-            # SOURCE end (seg[-1]) does NOT appear as a mouth end of another
-            # segment is a true headwater stub; only those are length-filtered.
             mouth_pixels = {seg[0] for seg, _ in lines}
-
             kept, dropped_stub, protected = [], 0, 0
             for seg, line in lines:
                 is_headwater_stub = seg[-1] not in mouth_pixels
@@ -806,7 +794,6 @@ def main():
                     if not is_headwater_stub and line.length < MIN_STREAM_LENGTH_M:
                         protected += 1
                     kept.append((seg, line))
-
             if dropped_stub:
                 logger.info(
                     f"  Removed {dropped_stub:,} headwater stubs shorter than "
@@ -814,26 +801,18 @@ def main():
                 )
             if protected:
                 logger.info(
-                    f"  Protected {protected:,} short connector segments "
-                    f"from length filter (topology preserved)"
+                    f"  Protected {protected:,} short connector segments from length filter"
                 )
             lines = kept
 
         if not lines:
-            logger.error(
-                "No segments survived the minimum length filter. "
-                "Lower MIN_STREAM_LENGTH_M in config.py."
-            )
-            sys.exit(1)
+            logger.error("  No segments survived the minimum length filter — skipping basin.")
+            return False
 
         count = 0
         with fiona.open(
-            str(out_path),
-            mode="w",
-            driver="GPKG",
-            schema=schema,
-            crs=out_crs,
-            layer="streams",
+            str(out_path), mode="w", driver="GPKG",
+            schema=schema, crs=out_crs, layer="streams",
         ) as dst:
             batch = []
             for seg, line in lines:
@@ -852,31 +831,96 @@ def main():
             if batch:
                 dst.writerecords(batch)
 
-        # ------------------------------------------------------------------
-        # Step 7: Longest branch extraction (optional)
-        # ------------------------------------------------------------------
+        # ── Step 9: Longest branch (optional) ─────────────────────────────────
         if EXTRACT_LONGEST_BRANCH:
-            # Re-read FAC for outlet detection (fac_data was freed after Step 1)
             with rasterio.open(str(fac_path)) as _src:
                 fac_arr_full = _src.read(1).astype(np.float32)
             extract_longest_branch(lines, fac_arr_full, adj, out_longest_path, out_crs, logger)
             del fac_arr_full
 
+        # ── Cleanup: delete intermediate FDR ──────────────────────────────────
+        if fdr_path.exists():
+            fdr_path.unlink()
+            logger.info(f"  Deleted intermediate FDR: {fdr_path.name}")
+
         elapsed = time.time() - start_time
-        logger.info("=" * 60)
-        logger.info("COMPLETE")
-        logger.info(f"  Network   : {out_path}")
-        logger.info(f"  Segments  : {count:,}")
+        logger.info(f"  Done — {count:,} segments in {elapsed / 60:.1f} min")
+        logger.info(f"  Streams : {out_path}")
+        logger.info(f"  FAC     : {fac_path}")
         if EXTRACT_LONGEST_BRANCH:
-            logger.info(f"  Longest   : {out_longest_path}")
-        logger.info(f"  Total time: {elapsed / 60:.1f} minutes")
-        logger.info("")
-        logger.info("Load the .gpkg files in QGIS or ArcGIS Pro to verify.")
-        logger.info("Each feature is a LineString ordered mouth->source.")
+            logger.info(f"  Longest : {out_longest_path}")
+
+        return True
 
     except Exception as e:
-        logger.error(f"FAILED: {e}", exc_info=True)
+        logger.error(f"  FAILED: {e}", exc_info=True)
+        return False
+
+
+def main():
+    basins_dir = Path(BASINS_DIR)
+
+    # Log to the basins directory
+    log_path = basins_dir / "stream_extraction_wbt.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.FileHandler(log_path),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+    logger = logging.getLogger(__name__)
+
+    if not basins_dir.exists():
+        logger.error(f"Basins directory not found: {basins_dir}")
+        logger.error("Run delineate_and_clip_basins.py first.")
         sys.exit(1)
+
+    # Find all per-basin DEMs
+    basin_dems = sorted(basins_dir.glob("basin_*.tif"))
+    if not basin_dems:
+        logger.error(f"No basin_*.tif files found in {basins_dir}")
+        sys.exit(1)
+
+    logger.info("=" * 60)
+    logger.info(f"Stream extraction — {len(basin_dems)} basin(s) found")
+    logger.info(f"Threshold        : {THRESHOLD:,} cells (~{THRESHOLD * 4 / 1e6:.1f} km² at 2m)")
+    logger.info(f"Min pixels       : {MIN_PIXELS}")
+    logger.info(f"Min stream length: {MIN_STREAM_LENGTH_M} m")
+    logger.info(f"Border cells     : {BORDER_CELLS}")
+    logger.info("=" * 60)
+
+    total_start = time.time()
+    succeeded, failed = [], []
+
+    for basin_dem in basin_dems:
+        basin_name = basin_dem.stem          # e.g. "basin_0001"
+        basin_dir  = basins_dir / basin_name # e.g. basins/basin_0001/
+
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info(f"Processing: {basin_name}")
+        logger.info("=" * 60)
+
+        ok = extract_streams_for_basin(basin_dem, basin_dir, logger)
+        if ok:
+            succeeded.append(basin_name)
+        else:
+            failed.append(basin_name)
+
+    elapsed_total = time.time() - total_start
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("ALL BASINS COMPLETE")
+    logger.info(f"  Succeeded : {len(succeeded)}")
+    logger.info(f"  Failed    : {len(failed)}")
+    if failed:
+        for name in failed:
+            logger.warning(f"    FAILED: {name}")
+    logger.info(f"  Total time: {elapsed_total / 60:.1f} minutes")
+    logger.info("=" * 60)
 
 
 if __name__ == "__main__":
