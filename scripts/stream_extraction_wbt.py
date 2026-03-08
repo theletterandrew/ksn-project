@@ -436,19 +436,10 @@ def extract_longest_branch(
                 else:
                     # j is more downstream → i should NOT list j as upstream
                     seg_upstream[i] = [k for k in seg_upstream[i] if k != j]
-    # For each segment, keep only the highest-FAC upstream neighbour as the
-    # main-stem continuation.  Multiple upstream candidates means a confluence
-    # is ambiguously connected; we resolve it greedily by drainage area so
-    # best_upstream_path always follows a single unbranched chain.
-    for i in list(seg_upstream.keys()):
-        ups = seg_upstream[i]
-        if len(ups) > 1:
-            # Pick the upstream segment whose mouth pixel has the highest FAC
-            # (most accumulated drainage = main stem, not a side tributary).
-            def _mouth_fac(j):
-                r, c = lines[j][0][0]
-                return float(fac_arr[r, c])
-            seg_upstream[i] = [max(ups, key=_mouth_fac)]
+    # Note: we intentionally keep ALL upstream candidates for each segment.
+    # best_upstream_path() explores all branches recursively and picks the
+    # longest by geometry — pruning to highest-FAC here would prevent it
+    # from finding the true longest path when a lower-FAC branch is longer.
     seg_lengths = [line.length for _, line in lines]
     memo = {}
 
