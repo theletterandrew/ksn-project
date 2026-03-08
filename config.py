@@ -85,7 +85,7 @@ MIN_STREAM_LENGTH_M = 100
 
 # Minimum number of skeleton pixels a segment must have to be kept.
 # Removes single-pixel stubs and very short noise branches.
-MIN_PIXELS = 5
+MIN_PIXELS = 10
 
 # Number of border cells to blank on all four edges before thresholding.
 # Edge cells drain off-raster in D8, accumulating spurious flow.
