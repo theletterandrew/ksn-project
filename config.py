@@ -91,6 +91,9 @@ MIN_PIXELS = 10
 # Edge cells drain off-raster in D8, accumulating spurious flow.
 BORDER_CELLS = 3
 
+# Determines whether or not stream extraction script extracts the longest branch or not
+EXTRACT_LONGEST_BRANCH = True
+
 # Minimum distance separating the outlet points (in meters)
 MIN_OUTLET_SEPARATION = 2000
 
