@@ -28,6 +28,7 @@ DATA_DEM_RAW_MOSAIC = DATA_DEM_MOSAIC / "dem_mosaic.tif"
 DATA_DEM_MOSAIC_WBT = DATA_DEM_MOSAIC / "dem_mosaic_wbt.tif"
 DATA_STREAMS = ROOT_DIR / "data" / "streams"
 DATA_WATERSHEDS = ROOT_DIR / "data" / "watersheds"
+DATA_BASINS = ROOT_DIR / "data" / "basins"
 DATA_KSN = ROOT_DIR / "data" / "ksn"
 
 # Scratch Data Paths

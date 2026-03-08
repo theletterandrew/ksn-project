@@ -51,7 +51,7 @@ AREA_CRS = "EPSG:32611"
 BREACHED_DEM  = os.path.join(CONDITIONING_DIR, "dem_filled.tif")
 D8_POINTER    = os.path.join(CONDITIONING_DIR, "flow_direction.tif")
 
-OUTPUT_DIR    = os.path.join(CONDITIONING_DIR, "basins")
+OUTPUT_DIR    = config.DATA_BASINS
 BASINS_RASTER = os.path.join(OUTPUT_DIR, "basins_raster.tif")
 BASINS_VECTOR = os.path.join(OUTPUT_DIR, "basins_polygons.shp")
 
