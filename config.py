@@ -108,6 +108,9 @@ WBT_BREACH_DIST = 100 if TEST_RUN else 1000
 # Full dataset: (~40 km² at 2m resolution)
 MIN_WATERSHED_AREA = 50_000 if TEST_RUN else 10000000
 
+# --- BASIN PARAMETERS ---
+MIN_BASIN_AREA_KM2 = 1.0 if TEST_RUN else 100.0
+
 # Pour points are snapped to the highest flow accumulation cell within
 # this distance to ensure they land exactly on the stream
 SNAP_DISTANCE = 10
