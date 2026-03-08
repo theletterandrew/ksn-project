@@ -166,6 +166,9 @@ def main():
         )
         sys.exit(1)
 
+    large_basins.to_file(BASINS_VECTOR, driver="ESRI Shapefile")
+    logger.info(f"Saved filtered basin polygons ({len(large_basins)} basins) to {BASINS_VECTOR}")
+
     with rasterio.open(BREACHED_DEM) as src:
         dem_crs = src.crs
 
