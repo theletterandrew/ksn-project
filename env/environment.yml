@@ -22,3 +22,4 @@ dependencies:
   - topotoolbox
   - pip:
       - python-dotenv
+      - topotoolbox
