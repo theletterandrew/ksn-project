@@ -879,13 +879,17 @@ def main():
         sys.exit(1)
 
     # Find all per-basin DEMs
-    basin_dems = sorted(basins_dir.glob("basin_*.tif"))
-    if not basin_dems:
-        logger.error(f"No basin_*.tif files found in {basins_dir}")
+    # Discover basins by finding basin_XXXX subdirectories containing dem.tif
+    basin_dirs = sorted([
+        d for d in basins_dir.iterdir()
+        if d.is_dir() and d.name.startswith("basin_") and (d / "dem.tif").exists()
+    ])
+    if not basin_dirs:
+        logger.error(f"No basin_XXXX/dem.tif found in {basins_dir}")
         sys.exit(1)
 
     logger.info("=" * 60)
-    logger.info(f"Stream extraction — {len(basin_dems)} basin(s) found")
+    logger.info(f"Stream extraction — {len(basin_dirs)} basin(s) found")
     logger.info(f"Threshold        : {THRESHOLD:,} cells (~{THRESHOLD * 4 / 1e6:.1f} km² at 2m)")
     logger.info(f"Min pixels       : {MIN_PIXELS}")
     logger.info(f"Min stream length: {MIN_STREAM_LENGTH_M} m")
@@ -895,16 +899,16 @@ def main():
     total_start = time.time()
     succeeded, failed = [], []
 
-    for basin_dem in basin_dems:
-        basin_name = basin_dem.stem          # e.g. "basin_0001"
-        basin_dir  = basins_dir / basin_name # e.g. basins/basin_0001/
+    for basin_dir in basin_dirs:
+        basin_name = basin_dir.name          # e.g. "basin_0001"
+        basin_dem  = basin_dir / "dem.tif"
 
         logger.info("")
         logger.info("=" * 60)
         logger.info(f"Processing: {basin_name}")
         logger.info("=" * 60)
 
-        ok = extract_streams_for_basin(basin_dem, basin_dir, logger)
+        ok = extract_streams_for_basin(basin_dem, basin_dir, logger)  # basin_dir is already the output dir
         if ok:
             succeeded.append(basin_name)
         else:
