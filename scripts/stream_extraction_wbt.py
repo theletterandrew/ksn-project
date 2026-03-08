@@ -549,11 +549,6 @@ def extract_longest_branch(
     for order, idx in enumerate(path_indices, start=1):
         seg, line = lines[idx]
         logger.info(f"  path seg[{idx}] order={order} mouth={seg[0]} source={seg[-1]} len={line.length:.1f}m")
-    if path_indices:
-        seg34 = lines[34][0]
-        logger.info(f"  seg[34] first 5 pixels: {seg34[:5]}")
-        logger.info(f"  seg[34] last  5 pixels: {seg34[-5:]}")
-        logger.info(f"  seg[34] total pixels: {len(seg34)}")
     with fiona.open(
         str(out_path), mode="w", driver="GPKG",
         schema=schema, crs=out_crs, layer="longest_branch",
