@@ -41,7 +41,7 @@ SCRIPTS_TO_RUN = [
     # "delineate_watersheds.py",
     # "clip_watersheds.py",
     # "extract_longest_branches.py",
-    "stream_and_watersheds.py",
+    "delineate_and_clip_basins.py",
     # "test_watershed_dtype.py",
     # "calculate_ksn.py",
     # "plot_stream_profiles.py"
