@@ -176,9 +176,11 @@ def main():
             large_basins = large_basins.to_crs(dem_crs)
 
         for _, row in large_basins.iterrows():
-            basin_id = int(row.get("VALUE", row.name))
-            area_km2 = row["area_km2"]
-            out_path = os.path.join(OUTPUT_DIR, f"basin_{basin_id:04d}.tif")
+            basin_id  = int(row.get("VALUE", row.name))
+            area_km2  = row["area_km2"]
+            basin_dir = os.path.join(OUTPUT_DIR, f"basin_{basin_id:04d}")
+            os.makedirs(basin_dir, exist_ok=True)
+            out_path  = os.path.join(basin_dir, "dem.tif")
 
             try:
                 clipped, transform = rio_mask(
@@ -197,7 +199,7 @@ def main():
                 with rasterio.open(out_path, "w", **out_meta) as dst:
                     dst.write(clipped)
 
-                logger.info(f"  Wrote basin_{basin_id:04d}.tif  ({area_km2:.1f} km²)")
+                logger.info(f"  Wrote basin_{basin_id:04d}/dem.tif  ({area_km2:.1f} km²)")
 
             except Exception as e:
                 logger.error(f"  Could not clip basin {basin_id}: {e}")
@@ -206,7 +208,7 @@ def main():
     logger.info("Done.")
     logger.info(f"  Basin raster  : {BASINS_RASTER}")
     logger.info(f"  Basin polygons: {BASINS_VECTOR}")
-    logger.info(f"  Clipped DEMs  : {OUTPUT_DIR}/basin_XXXX.tif")
+    logger.info(f"  Clipped DEMs  : {OUTPUT_DIR}/basin_XXXX/dem.tif")
     logger.info("=" * 60)
 
 
