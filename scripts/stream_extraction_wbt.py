@@ -66,7 +66,7 @@ import config
 # =============================================================================
 
 WBT_EXE    = config.WBT_EXE
-BASINS_DIR = Path(config.DATA_SCRATCH_WBT) / "basins"  # Output of delineate_and_clip_basins.py
+BASINS_DIR = config.DATA_BASINS  # Output of delineate_and_clip_basins.py
 
 # Drainage area threshold (cells). At 2 m resolution:
 #   500,000  cells = ~2 km²
@@ -859,6 +859,7 @@ def extract_streams_for_basin(
 
 def main():
     basins_dir = Path(BASINS_DIR)
+    basins_dir.mkdir(parents=True, exist_ok=True)
 
     # Log to the basins directory
     log_path = basins_dir / "stream_extraction_wbt.log"
@@ -872,11 +873,6 @@ def main():
         ],
     )
     logger = logging.getLogger(__name__)
-
-    if not basins_dir.exists():
-        logger.error(f"Basins directory not found: {basins_dir}")
-        logger.error("Run delineate_and_clip_basins.py first.")
-        sys.exit(1)
 
     # Find all per-basin DEMs
     # Discover basins by finding basin_XXXX subdirectories containing dem.tif
