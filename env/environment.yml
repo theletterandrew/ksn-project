@@ -19,5 +19,6 @@ dependencies:
   - geopandas
   - matplotlib
   - fiona
+  - topotoolbox
   - pip:
       - python-dotenv
