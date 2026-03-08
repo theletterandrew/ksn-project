@@ -380,16 +380,12 @@ def extract_main_stem(
     logger: logging.Logger,
 ) -> None:
     """
-    Use WhiteboxTools FindMainStem to identify the longest path from outlet
-    to headwater, then vectorize the result using rasterio/shapely.
+    Use WhiteboxTools FindMainStem to identify the main stem (longest
+    outlet-to-headwater path), then vectorize the output raster using
+    rasterio/shapely.
 
-    Inputs:
-        stream_raster — binary stream raster (1=stream, 0/nodata=no stream)
-        fac_path      — flow accumulation raster
-        fdr_path      — flow direction raster (WBT native encoding)
-        out_path      — output GeoPackage path
-        out_crs       — CRS for output (WKT string)
-        transform     — rasterio affine transform for pixel->coord conversion
+    The stream_raster must be the UNBLANKED version so WBT can see the
+    outlet pixel at the basin edge.
     """
     if not stream_raster.exists():
         logger.warning("  Stream raster not found — skipping main stem extraction.")
@@ -409,15 +405,14 @@ def extract_main_stem(
         logger.error("  FindMainStem failed — skipping main stem extraction.")
         return
 
-    # Vectorize the main stem raster using rasterio/shapely
-    logger.info("  Vectorizing main stem raster...")
     try:
+        # Vectorize the main stem raster using rasterio/shapely
+        logger.info("  Vectorizing main stem raster...")
         with rasterio.open(str(main_stem_raster)) as src:
-            data    = src.read(1)
-            nodata  = src.nodata
+            data         = src.read(1)
             ms_transform = src.transform
 
-        # Main stem pixels have value 1
+        # FindMainStem output: main stem cells have value 1
         main_stem_mask = (data == 1)
         pixel_count = int(main_stem_mask.sum())
         logger.info(f"  Main stem pixels: {pixel_count:,}")
@@ -426,24 +421,24 @@ def extract_main_stem(
             logger.warning("  No main stem pixels found in output raster.")
             return
 
-        # Trace pixel chain from the main stem mask using 8-connectivity.
-        # Walk from the outlet (highest FAC pixel) to headwater.
+        # Load FAC to determine flow direction along the stem
         with rasterio.open(str(fac_path)) as _src:
             fac_arr = _src.read(1).astype(np.float32)
 
         rows, cols = np.where(main_stem_mask)
         stem_pixels = set(zip(rows.tolist(), cols.tolist()))
 
-        # Find outlet: main stem pixel with highest FAC
+        # Start at outlet: main stem pixel with highest FAC
         outlet = max(stem_pixels, key=lambda rc: float(fac_arr[rc[0], rc[1]]))
 
-        # Walk upstream pixel by pixel following highest FAC neighbour
-        # that is also on the main stem
+        # Walk upstream pixel by pixel following the stem neighbour with
+        # the next-lower FAC value (strictly upstream = decreasing FAC)
         chain = [outlet]
         visited = {outlet}
         current = outlet
         while True:
             r, c = current
+            current_fac = float(fac_arr[r, c])
             best_next = None
             best_fac = -1.0
             for dr in (-1, 0, 1):
@@ -453,8 +448,8 @@ def extract_main_stem(
                     nb = (r + dr, c + dc)
                     if nb in stem_pixels and nb not in visited:
                         nb_fac = float(fac_arr[nb[0], nb[1]])
-                        # Walk upstream = decreasing FAC
-                        if nb_fac < float(fac_arr[r, c]) and nb_fac > best_fac:
+                        # Upstream = lower FAC, pick highest among valid upstream
+                        if nb_fac < current_fac and nb_fac > best_fac:
                             best_fac = nb_fac
                             best_next = nb
             if best_next is None:
@@ -463,16 +458,16 @@ def extract_main_stem(
             visited.add(best_next)
             current = best_next
 
-        logger.info(f"  Main stem chain length: {len(chain):,} pixels")
+        logger.info(f"  Main stem chain: {len(chain):,} pixels traced")
 
-        # Convert pixel chain to LineString
+        # Convert pixel chain to a single LineString
         coords = [
             (ms_transform.c + (c + 0.5) * ms_transform.a,
              ms_transform.f + (r + 0.5) * ms_transform.e)
             for r, c in chain
         ]
         line = LineString(coords)
-        logger.info(f"  Main stem length: {line.length:.1f} m  ({line.length/1000:.2f} km)")
+        logger.info(f"  Main stem length: {line.length:.1f} m  ({line.length / 1000:.2f} km)")
 
         schema = {
             "geometry": "LineString",
@@ -500,7 +495,6 @@ def extract_main_stem(
         logger.info(f"  Written to: {out_path}")
 
     finally:
-        # Clean up intermediate main stem raster
         if main_stem_raster.exists():
             main_stem_raster.unlink()
             logger.info(f"  Deleted intermediate raster: {main_stem_raster.name}")
@@ -561,11 +555,11 @@ def extract_streams_for_basin(
     """
     basin_dir.mkdir(parents=True, exist_ok=True)
 
-    fdr_path        = basin_dir / "fdr.tif"
-    fac_path        = basin_dir / "fac.tif"
-    stream_raster   = basin_dir / "streams_raster.tif"
-    out_path        = basin_dir / "streams_connected.gpkg"
-    out_main_stem   = basin_dir / "main_stem.gpkg"
+    fdr_path      = basin_dir / "fdr.tif"
+    fac_path      = basin_dir / "fac.tif"
+    stream_raster = basin_dir / "streams_raster.tif"
+    out_path      = basin_dir / "streams_connected.gpkg"
+    out_main_stem = basin_dir / "main_stem.gpkg"
 
     start_time = time.time()
 
@@ -602,24 +596,10 @@ def extract_streams_for_basin(
 
         valid_mask  = (fac_data != nodata) if nodata is not None else np.ones_like(fac_data, dtype=bool)
         stream_mask = (fac_data >= THRESHOLD) & valid_mask
-
-        if BORDER_CELLS > 0:
-            b = BORDER_CELLS
-            stream_mask[:b,  :] = False
-            stream_mask[-b:, :] = False
-            stream_mask[:,  :b] = False
-            stream_mask[:, -b:] = False
-            logger.info(f"  Blanked {b}-cell border to suppress edge artifacts")
-
-        pixel_count = int(stream_mask.sum())
-        logger.info(f"  Stream pixels above threshold: {pixel_count:,}")
         del fac_data, valid_mask
 
-        if pixel_count == 0:
-            logger.error("  No stream pixels at this threshold — skipping basin.")
-            return False
-
-        # Save stream mask as raster for FindMainStem
+        # Save unblanked stream raster for FindMainStem — WBT needs the outlet
+        # pixel to be present, so we must save BEFORE border blanking.
         stream_meta = {
             "driver":    "GTiff",
             "dtype":     "uint8",
@@ -632,6 +612,22 @@ def extract_streams_for_basin(
         }
         with rasterio.open(str(stream_raster), "w", **stream_meta) as dst:
             dst.write(stream_mask.astype(np.uint8), 1)
+
+        # Now blank the border for vector network extraction only
+        if BORDER_CELLS > 0:
+            b = BORDER_CELLS
+            stream_mask[:b,  :] = False
+            stream_mask[-b:, :] = False
+            stream_mask[:,  :b] = False
+            stream_mask[:, -b:] = False
+            logger.info(f"  Blanked {b}-cell border to suppress edge artifacts")
+
+        pixel_count = int(stream_mask.sum())
+        logger.info(f"  Stream pixels above threshold: {pixel_count:,}")
+
+        if pixel_count == 0:
+            logger.error("  No stream pixels at this threshold — skipping basin.")
+            return False
 
         # ── Step 4: Read FDR ───────────────────────────────────────────────────
         logger.info("  Step 4: Reading FDR raster...")
