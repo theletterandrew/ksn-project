@@ -480,34 +480,25 @@ def extract_longest_branch(
     best_total = -1.0
     path_indices = []
     downstream_start_idx = None
-    # Identify true outlet segments: segments whose mouth pixel is NOT the
-    # source pixel of any other segment.  Only outlets can be the downstream
-    # start of the longest branch — starting from a tributary mid-network
-    # would pick a path that begins partway up the stem and merges two
-    # branches rather than tracing a single outlet->headwater path.
-    all_source_pixels = {seg[-1] for seg, _ in lines}
-    outlet_indices = [
-        i for i, (seg, _) in enumerate(lines)
-        if seg[0] not in all_source_pixels
-    ]
-    if not outlet_indices:
-        # Fallback: degenerate network (e.g. a loop) — evaluate all segments.
-        logger.warning("  No outlet segments detected; falling back to evaluating all segments.")
-        outlet_indices = list(range(len(lines)))
+    # Identify the true basin outlet as the single segment with the highest
+    # FAC at its mouth.  In a properly delineated basin there is exactly one
+    # outlet and it always has the greatest accumulated drainage area.  Using
+    # FAC directly is more robust than topological heuristics (e.g. "mouth not
+    # in any source set") which can fail when the main stem outlet is trimmed
+    # by the border or length filters.
+    true_outlet_idx = max(
+        range(len(lines)),
+        key=lambda i: float(fac_arr[lines[i][0][0][0], lines[i][0][0][1]])
+    )
+    logger.info(
+        f"  True outlet: seg[{true_outlet_idx}] "
+        f"mouth={lines[true_outlet_idx][0][0]} "
+        f"FAC={float(fac_arr[lines[true_outlet_idx][0][0][0], lines[true_outlet_idx][0][0][1]]):.0f}"
+    )
 
-    logger.info(f"  Outlet segments found: {len(outlet_indices)}")
-
-    # Evaluate only outlet segments as possible downstream starts and
-    # pick the globally longest connected branch.
-    best_total = -1.0
-    path_indices = []
-    downstream_start_idx = None
-    for i in outlet_indices:          # <-- was: range(len(lines))
-        total, path = best_upstream_path(i, set())
-        if total > best_total:
-            best_total = total
-            path_indices = path
-            downstream_start_idx = i
+    # Start the longest-path search from the true outlet only.
+    best_total, path_indices = best_upstream_path(true_outlet_idx, set())
+    downstream_start_idx = true_outlet_idx
 
     if downstream_start_idx is None or not path_indices:
         logger.warning("  Could not determine a valid longest branch path.")
