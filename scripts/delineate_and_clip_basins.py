@@ -23,6 +23,7 @@ import logging
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import geopandas as gpd
 import rasterio
