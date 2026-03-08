@@ -732,12 +732,33 @@ def extract_streams_for_basin(
 
         junction_pixels_set = {n for n, nbrs in adj.items() if len(nbrs) >= 3}
         before = len(segments)
-        kept_drain = []
+
+        # Separate segments into those that drain off the raster edge and those
+        # that don't.  For a basin clipped from a larger DEM the true outlet
+        # SHOULD drain off the edge — we want to keep exactly that one segment
+        # (the one with the highest FAC at its mouth = most upstream area) and
+        # discard all other edge-draining segments as boundary artifacts.
+        with rasterio.open(str(fac_path)) as _fac_src:
+            fac_for_filter = _fac_src.read(1).astype(np.float32)
+
+        edge_draining = []
+        non_edge = []
         for s in segments:
             is_connector = s[0] in junction_pixels_set and s[-1] in junction_pixels_set
-            if is_connector or not drains_off_edge(s, fdr_arr, fdr_nodata):
-                kept_drain.append(s)
-        segments = kept_drain
+            if not is_connector and drains_off_edge(s, fdr_arr, fdr_nodata):
+                edge_draining.append(s)
+            else:
+                non_edge.append(s)
+
+        if edge_draining:
+            # Keep the one true outlet — highest FAC at mouth pixel
+            true_outlet = max(edge_draining, key=lambda s: float(fac_for_filter[s[0][0], s[0][1]]))
+            discarded = len(edge_draining) - 1
+            segments = non_edge + [true_outlet]
+            if discarded:
+                logger.info(f"  Kept 1 true outlet (highest FAC); removed {discarded} edge-draining artifact(s)")
+        del fac_for_filter
+
         removed = before - len(segments)
         if removed:
             logger.info(f"  Removed {removed:,} edge-draining segments (boundary artifacts)")
