@@ -41,7 +41,7 @@ from config import WBT_EXE
 CONDITIONING_DIR = config.DATA_SCRATCH_WBT
 
 # Minimum basin area to export (km²) — filters out small edge-draining slivers
-MIN_BASIN_AREA_KM2 = 100.0
+MIN_BASIN_AREA_KM2 = config.MIN_BASIN_AREA_KM2
 
 # UTM CRS for area calculation — UTM Zone 11N is correct for San Bernardino Mountains
 AREA_CRS = "EPSG:32611"
