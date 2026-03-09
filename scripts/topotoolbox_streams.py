@@ -11,6 +11,7 @@ For each basin_XXXX/ folder:
   4. Isolate the largest connected component
   5. Extract the trunk river (main stem)
   6. Export the trunk as a GeoPackage to basin_XXXX/main_stem.gpkg
+  7. Export the full stream network as a GeoPackage to basin_XXXX/stream_network.gpkg
 
 USAGE:
     python topotoolbox_streams.py
@@ -123,6 +124,61 @@ def export_trunk(trunk, basin_dir: Path, out_crs, logger: logging.Logger) -> Non
     logger.info(f"  Written to: {out_path}")
 
 
+def export_stream_network(stream, basin_dir: Path, out_crs, logger: logging.Logger) -> None:
+    """
+    Export a StreamObject's full network to a GeoPackage.
+
+    stream.xy() returns one sublist of coordinates per segment (i.e. per
+    tributary branch). Each sublist becomes its own LineString feature so
+    that the network retains its branching structure in GIS.
+    """
+    coord_groups = stream.xy()
+
+    if not coord_groups:
+        logger.warning("  stream.xy() returned no coordinates — skipping network export.")
+        return
+
+    # Build one LineString per segment, skipping any degenerate groups
+    features = []
+    for group in coord_groups:
+        if len(group) < 2:
+            continue
+        line = LineString(group)
+        features.append({
+            "geometry": mapping(line),
+            "properties": {
+                "length_m":   round(line.length, 2),
+                "n_vertices": len(group),
+            },
+        })
+
+    if not features:
+        logger.warning("  No valid segments found — skipping network export.")
+        return
+
+    logger.info(f"  Stream network segments: {len(features)}")
+
+    out_path = basin_dir / "stream_network.gpkg"
+    if out_path.exists():
+        out_path.unlink()
+
+    schema = {
+        "geometry": "LineString",
+        "properties": {
+            "length_m":   "float",
+            "n_vertices": "int",
+        },
+    }
+
+    with fiona.open(
+        str(out_path), mode="w", driver="GPKG",
+        schema=schema, crs=out_crs, layer="stream_network",
+    ) as dst:
+        dst.writerecords(features)
+
+    logger.info(f"  Written to: {out_path}")
+
+
 def process_basin(basin_dir: Path, logger: logging.Logger) -> bool:
     """
     Run the full topotoolbox stream extraction pipeline for one basin.
@@ -158,15 +214,18 @@ def process_basin(basin_dir: Path, logger: logging.Logger) -> bool:
         logger.info("  Step 5: Extracting trunk river...")
         trunk = s_main.trunk()
 
-        # ── Step 6: Export ────────────────────────────────────────────────────
-        logger.info("  Step 6: Exporting trunk to GeoPackage...")
-
         # Get CRS from the source DEM using rasterio
         import rasterio
         with rasterio.open(str(dem_path)) as src:
             out_crs = src.crs.to_wkt() if src.crs else None
 
+        # ── Step 6: Export trunk ───────────────────────────────────────────────
+        logger.info("  Step 6: Exporting trunk to GeoPackage...")
         export_trunk(trunk, basin_dir, out_crs, logger)
+
+        # ── Step 7: Export full stream network ────────────────────────────────
+        logger.info("  Step 7: Exporting full stream network to GeoPackage...")
+        export_stream_network(s_main, basin_dir, out_crs, logger)
 
         elapsed = time.time() - start
         logger.info(f"  Done in {elapsed:.1f}s")
