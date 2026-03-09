@@ -293,8 +293,9 @@ def sample_trunk_topotoolbox(fd, trunk, dem, spacing: float,
 
         # ── Elevation ─────────────────────────────────────────────────────────
         cellsize = float(dem.cellsize)
-        origin_x = float(dem.georef.get("west", 0))
-        origin_y = float(dem.georef.get("north", 0))
+        # dem.transform is an affine matrix; .c = x left edge, .f = y top edge
+        origin_x = float(dem.transform.c)  # west edge (x origin)
+        origin_y = float(dem.transform.f)  # north edge (y origin)
 
         def xy_to_rc(x, y):
             col = ((x - origin_x) / cellsize).astype(int)
