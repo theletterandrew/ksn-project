@@ -27,6 +27,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import geopandas as gpd
 import rasterio
 from rasterio.mask import mask as rio_mask
@@ -233,11 +234,37 @@ def main():
                 "altitude": HILLSHADE_ALTITUDE,
             }, logger)
 
-            if success:
+            if not success:
+                logger.error(f"  Hillshade failed for basin_{basin_id:04d}")
+                hillshade_fail += 1
+                continue
+
+            # Mask hillshade to basin polygon shape (WBT outputs full bbox).
+            # Use nodata=-1 — valid hillshade values are 0–254, so -1 is
+            # unambiguous and fits WBT's int16 output dtype.
+            try:
+                with rasterio.open(hillshade_path) as hs_src:
+                    hs_clipped, hs_transform = rio_mask(
+                        hs_src, [row.geometry], crop=True, nodata=-1
+                    )
+                    hs_meta = hs_src.meta.copy()
+                    hs_meta.update({
+                        "driver":    "GTiff",
+                        "height":    hs_clipped.shape[1],
+                        "width":     hs_clipped.shape[2],
+                        "transform": hs_transform,
+                        "nodata":    -1,
+                        "compress":  "lzw"
+                    })
+
+                with rasterio.open(hillshade_path, "w", **hs_meta) as hs_dst:
+                    hs_dst.write(hs_clipped)
+
                 logger.info(f"  Wrote basin_{basin_id:04d}/hillshade.tif")
                 hillshade_ok += 1
-            else:
-                logger.error(f"  Hillshade failed for basin_{basin_id:04d}")
+
+            except Exception as e:
+                logger.error(f"  Could not mask hillshade for basin {basin_id}: {e}")
                 hillshade_fail += 1
 
     logger.info("=" * 60)
