@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 topotoolbox_analysis.py
 -----------------------
@@ -11,17 +12,17 @@ For each basin_XXXX/ folder:
   3. Extract the stream network (StreamObject)
   4. Isolate the largest connected component
   5. Extract the trunk river (main stem)
-  6. Export the trunk as a GeoPackage    → basin_XXXX/main_stem.gpkg
-  7. Export the full stream network      → basin_XXXX/stream_network.gpkg
+  6. Export the trunk as a GeoPackage    -> basin_XXXX/main_stem.gpkg
+  7. Export the full stream network      -> basin_XXXX/stream_network.gpkg
   8. Sample elevation, distance, chi, and ksn along the trunk at 50m intervals
-  9. Export sampled metrics as points    → basin_XXXX/ksn_chi_points.gpkg
+  9. Export sampled metrics as points    -> basin_XXXX/ksn_chi_points.gpkg
  10. Export three profile plots (PNG):
        basin_XXXX/plot_elev_distance.png
        basin_XXXX/plot_elev_chi.png
        basin_XXXX/plot_elev_ksn.png
 
 Chi is computed with a reference concavity (m/n) of 0.45.
-Ksn is computed as slope × drainage_area^(m/n), smoothed with a moving
+Ksn is computed as slope x drainage_area^(m/n), smoothed with a moving
 window average along the trunk.
 
 USAGE:
@@ -60,8 +61,8 @@ import config
 BASINS_DIR = Path(config.DATA_BASINS)
 
 # Stream initiation threshold in pixels. At 2m resolution:
-#   25,000 pixels  = ~0.1 km²
-#   250,000 pixels = ~1 km²
+#   25,000 pixels  = ~0.1 km^2
+#   250,000 pixels = ~1 km^2
 # Adjust until the extracted network looks right for your basins.
 THRESHOLD = config.STREAM_THRESHOLD
 
@@ -77,7 +78,7 @@ KSN_WINDOW = config.SMOOTHING_WINDOW
 
 # Reference drainage area for chi (A0). Set to 1 m² so chi has units of
 # metres, making it directly comparable across basins.
-A0 = 1.0
+A0 = config.A0
 
 # =============================================================================
 # END CONFIG
@@ -91,8 +92,8 @@ def setup_logging(basins_dir: Path) -> logging.Logger:
         format="%(asctime)s  %(levelname)-8s  %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[
-            logging.FileHandler(log_path, mode="w"),
-            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(log_path, mode="w", encoding="utf-8"),
+            logging.StreamHandler(stream=open(sys.stdout.fileno(), mode="w", encoding="utf-8", closefd=False)),
         ],
     )
     return logging.getLogger(__name__)
@@ -450,7 +451,7 @@ def export_ksn_chi_points(data: dict, basin_dir: Path, out_crs,
     ) as dst:
         dst.writerecords(features)
 
-    logger.info(f"  Exported {len(features)} points → {out_path}")
+    logger.info(f"  Exported {len(features)} points -> {out_path}")
 
 
 def export_plots(data: dict, basin_dir: Path, basin_name: str,
@@ -466,19 +467,19 @@ def export_plots(data: dict, basin_dir: Path, basin_name: str,
             "x":        dist_km,
             "xlabel":   "Distance from mouth (km)",
             "filename": "plot_elev_distance.png",
-            "title":    f"{basin_name} — Elevation vs Distance",
+            "title":    f"{basin_name} - Elevation vs Distance",
         },
         {
             "x":        chi,
-            "xlabel":   f"Chi (m/n = {THETA_REF}, A₀ = {A0} m²)",
+            "xlabel":   f"Chi (m/n = {THETA_REF}, A0 = {A0} m^2)",
             "filename": "plot_elev_chi.png",
-            "title":    f"{basin_name} — Elevation vs Chi",
+            "title":    f"{basin_name} - Elevation vs Chi",
         },
         {
             "x":        ksn,
-            "xlabel":   f"Ksn (smoothed, window = {KSN_WINDOW} pts × {POINT_SPACING_M} m)",
+            "xlabel":   f"Ksn (smoothed, window = {KSN_WINDOW} pts x {POINT_SPACING_M} m)",
             "filename": "plot_elev_ksn.png",
-            "title":    f"{basin_name} — Elevation vs Ksn",
+            "title":    f"{basin_name} - Elevation vs Ksn",
         },
     ]
 
@@ -493,7 +494,7 @@ def export_plots(data: dict, basin_dir: Path, basin_name: str,
         out_path = basin_dir / spec["filename"]
         fig.savefig(str(out_path), dpi=150)
         plt.close(fig)
-        logger.info(f"  Saved plot → {out_path}")
+        logger.info(f"  Saved plot -> {out_path}")
 
 
 # =============================================================================
