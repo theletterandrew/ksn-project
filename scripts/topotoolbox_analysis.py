@@ -66,14 +66,14 @@ BASINS_DIR = Path(config.DATA_BASINS)
 THRESHOLD = config.STREAM_THRESHOLD
 
 # Reference concavity index (m/n) for chi integration
-THETA_REF = 0.45
+THETA_REF = config.REFERENCE_CONCAVITY
 
 # Point spacing along trunk for ksn/chi export (metres)
-POINT_SPACING_M = 50
+POINT_SPACING_M = config.SAMPLE_DISTANCE
 
 # Moving window size for ksn smoothing (number of sample points).
 # At 50m spacing, 10 points = 500m window.
-KSN_WINDOW = 10
+KSN_WINDOW = config.SMOOTHING_WINDOW
 
 # Reference drainage area for chi (A0). Set to 1 m² so chi has units of
 # metres, making it directly comparable across basins.
