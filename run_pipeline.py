@@ -39,7 +39,6 @@ SCRIPTS_TO_RUN = [
     # "wbt_hydrology.py",
     "basins.py",
     "topotoolbox_streams.py",
-    # "extract_longest_branches.py",
     # "calculate_ksn.py",
     # "plot_stream_profiles.py"
 ]
