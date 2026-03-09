@@ -115,6 +115,13 @@ MIN_WATERSHED_AREA = 50_000 if TEST_RUN else 10000000
 # --- BASIN PARAMETERS ---
 MIN_BASIN_AREA_KM2 = 1.0 if TEST_RUN else 100.0
 
+# Hillshade angles
+# Sun azimuth in degrees (0–360, clockwise from north; 315 = northwest is standard)
+HILLSHADE_AZIMUTH = 315.0
+
+# Sun altitude angle in degrees above the horizon (0–90; 45 is a common default)
+HILLSHADE_ALTITUDE = 45.0
+
 # Pour points are snapped to the highest flow accumulation cell within
 # this distance to ensure they land exactly on the stream
 SNAP_DISTANCE = 10
