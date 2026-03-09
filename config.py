@@ -134,4 +134,7 @@ MIN_DRAINAGE_AREA_M2 = 200000 if TEST_RUN else 1000000
 REFERENCE_CONCAVITY  = 0.45          # Reference concavity index (theta_ref)
 SMOOTHING_WINDOW     = 5             # Window size (cells) for gradient smoothing
 SAMPLE_DISTANCE      = 50            # Sample points every N meters along streams
+# Reference drainage area for chi (A0). Set to 1 m² so chi has units of
+# metres, making it directly comparable across basins.
+A0                   = 1.0
 MIN_TRIBUTARY_LENGTH_M = 100         # Length (m) of minimum tributary length. Filters out short stream segments.
