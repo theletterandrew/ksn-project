@@ -5,6 +5,7 @@ Takes the outputs of the hydrological conditioning script and:
   1. Delineates drainage basins using WhiteboxTools (via subprocess)
   2. Converts the basin raster to vector polygons
   3. Clips the breached DEM to each basin and saves as individual GeoTIFFs
+  4. Generates a hillshade TIF for each clipped basin DEM
 
 Inputs (from conditioning script):
   - Filled/breached DEM  : <CONDITIONING_DIR>/dem_breached.tif
@@ -13,7 +14,8 @@ Inputs (from conditioning script):
 Outputs (in <CONDITIONING_DIR>/basins/):
   - basins_raster.tif    : Integer raster, one unique value per basin
   - basins_polygons.shp  : Vector polygons of each basin
-  - basin_<ID>.tif       : Clipped breached DEM for each qualifying basin
+  - basin_<ID>/dem.tif   : Clipped breached DEM for each qualifying basin
+  - basin_<ID>/hillshade.tif : Hillshade for each qualifying basin
 
 Dependencies:
   pip install rasterio numpy geopandas shapely
@@ -45,6 +47,14 @@ MIN_BASIN_AREA_KM2 = config.MIN_BASIN_AREA_KM2
 
 # UTM CRS for area calculation — UTM Zone 11N is correct for San Bernardino Mountains
 AREA_CRS = "EPSG:32611"
+
+# ─── HILLSHADE CONFIG ─────────────────────────────────────────────────────────
+
+# Sun azimuth in degrees (0–360, clockwise from north; 315 = northwest is standard)
+HILLSHADE_AZIMUTH = 315.0
+
+# Sun altitude angle in degrees above the horizon (0–90; 45 is a common default)
+HILLSHADE_ALTITUDE = 45.0
 
 # ─── DERIVED PATHS ────────────────────────────────────────────────────────────
 
@@ -169,6 +179,14 @@ def main():
     large_basins.to_file(BASINS_VECTOR, driver="ESRI Shapefile")
     logger.info(f"Saved filtered basin polygons ({len(large_basins)} basins) to {BASINS_VECTOR}")
 
+    # ── Steps 3 & 4: Clip DEM and generate hillshade per basin ────────────────
+    logger.info("=" * 60)
+    logger.info("Steps 3 & 4: Clipping DEM and generating hillshades")
+    logger.info("=" * 60)
+
+    hillshade_ok = 0
+    hillshade_fail = 0
+
     with rasterio.open(BREACHED_DEM) as src:
         dem_crs = src.crs
 
@@ -180,8 +198,10 @@ def main():
             area_km2  = row["area_km2"]
             basin_dir = os.path.join(OUTPUT_DIR, f"basin_{basin_id:04d}")
             os.makedirs(basin_dir, exist_ok=True)
-            out_path  = os.path.join(basin_dir, "dem.tif")
+            dem_path       = os.path.join(basin_dir, "dem.tif")
+            hillshade_path = os.path.join(basin_dir, "hillshade.tif")
 
+            # ── Step 3: Clip DEM ───────────────────────────────────────────────
             try:
                 clipped, transform = rio_mask(
                     src, [row.geometry], crop=True, nodata=src.nodata
@@ -196,19 +216,37 @@ def main():
                     "compress":  "lzw"
                 })
 
-                with rasterio.open(out_path, "w", **out_meta) as dst:
+                with rasterio.open(dem_path, "w", **out_meta) as dst:
                     dst.write(clipped)
 
                 logger.info(f"  Wrote basin_{basin_id:04d}/dem.tif  ({area_km2:.1f} km²)")
 
             except Exception as e:
                 logger.error(f"  Could not clip basin {basin_id}: {e}")
+                continue  # Skip hillshade if DEM clip failed
+
+            # ── Step 4: Generate hillshade from clipped DEM ────────────────────
+            success = run_wbt("Hillshade", {
+                "dem":      dem_path,
+                "output":   hillshade_path,
+                "azimuth":  HILLSHADE_AZIMUTH,
+                "altitude": HILLSHADE_ALTITUDE,
+            }, logger)
+
+            if success:
+                logger.info(f"  Wrote basin_{basin_id:04d}/hillshade.tif")
+                hillshade_ok += 1
+            else:
+                logger.error(f"  Hillshade failed for basin_{basin_id:04d}")
+                hillshade_fail += 1
 
     logger.info("=" * 60)
     logger.info("Done.")
-    logger.info(f"  Basin raster  : {BASINS_RASTER}")
-    logger.info(f"  Basin polygons: {BASINS_VECTOR}")
-    logger.info(f"  Clipped DEMs  : {OUTPUT_DIR}/basin_XXXX/dem.tif")
+    logger.info(f"  Basin raster   : {BASINS_RASTER}")
+    logger.info(f"  Basin polygons : {BASINS_VECTOR}")
+    logger.info(f"  Clipped DEMs   : {OUTPUT_DIR}/basin_XXXX/dem.tif")
+    logger.info(f"  Hillshades     : {OUTPUT_DIR}/basin_XXXX/hillshade.tif")
+    logger.info(f"  Hillshades OK  : {hillshade_ok}  |  Failed: {hillshade_fail}")
     logger.info("=" * 60)
 
 
