@@ -51,10 +51,10 @@ AREA_CRS = "EPSG:32611"
 # ─── HILLSHADE CONFIG ─────────────────────────────────────────────────────────
 
 # Sun azimuth in degrees (0–360, clockwise from north; 315 = northwest is standard)
-HILLSHADE_AZIMUTH = 315.0
+HILLSHADE_AZIMUTH = config.HILLSHADE_AZIMUTH
 
 # Sun altitude angle in degrees above the horizon (0–90; 45 is a common default)
-HILLSHADE_ALTITUDE = 45.0
+HILLSHADE_ALTITUDE = config.HILLSHADE_ALTITUDE
 
 # ─── DERIVED PATHS ────────────────────────────────────────────────────────────
 
