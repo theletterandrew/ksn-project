@@ -38,9 +38,7 @@ SCRIPTS_TO_RUN = [
     # "mosaic_dem.py",
     # "wbt_hydrology.py",
     "basins.py",
-    "topotoolbox_analysis.py",
-    # "calculate_ksn.py",
-    # "plot_stream_profiles.py"
+    "topotoolbox_analysis.py"
 ]
 
 
