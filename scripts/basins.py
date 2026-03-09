@@ -59,7 +59,7 @@ HILLSHADE_ALTITUDE = config.HILLSHADE_ALTITUDE
 
 # ─── DERIVED PATHS ────────────────────────────────────────────────────────────
 
-BREACHED_DEM  = os.path.join(CONDITIONING_DIR, "dem_filled.tif")
+BREACHED_DEM  = os.path.join(CONDITIONING_DIR, "dem_breached.tif")
 D8_POINTER    = os.path.join(CONDITIONING_DIR, "flow_direction.tif")
 
 OUTPUT_DIR    = config.DATA_BASINS
