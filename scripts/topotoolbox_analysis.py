@@ -211,10 +211,11 @@ def export_stream_network(stream, basin_dir: Path, out_crs, logger: logging.Logg
 
 
 # =============================================================================
+# =============================================================================
 # KSN / CHI HELPERS
 # =============================================================================
 
-def moving_average(arr: np.ndarray, window: int) -> np.ndarray:
+def moving_average(arr, window):
     """Apply a centred moving average, preserving array length."""
     if window < 2 or len(arr) < window:
         return arr.copy()
@@ -223,192 +224,110 @@ def moving_average(arr: np.ndarray, window: int) -> np.ndarray:
     return smoothed[:len(arr)]
 
 
-def compute_chi(distance_m: np.ndarray, drainage_area_m2: np.ndarray,
-                theta: float, a0: float) -> np.ndarray:
-    """
-    Numerically integrate chi along the trunk from mouth to headwater.
-
-    chi(x) = integral from mouth to x of (A0 / A(x'))^theta dx'
-
-    distance_m and drainage_area_m2 must be ordered mouth -> headwater.
-    Uses the trapezoidal rule.
-    """
-    integrand = (a0 / drainage_area_m2) ** theta
-    dx = np.diff(distance_m)
-    mid = (integrand[:-1] + integrand[1:]) / 2.0
-    chi = np.zeros(len(distance_m))
-    chi[1:] = np.cumsum(mid * dx)
-    return chi
-
-
-def compute_ksn(slope: np.ndarray, drainage_area_m2: np.ndarray,
-                theta: float, window: int) -> np.ndarray:
-    """
-    Compute ksn = slope / (A^theta), then smooth with a moving window.
-    """
-    safe_area = np.where(drainage_area_m2 > 0, drainage_area_m2, np.nan)
-    ksn_raw = slope / (safe_area ** theta)
-    ksn_raw = np.nan_to_num(ksn_raw, nan=0.0)
-    return moving_average(ksn_raw, window)
-
-
 # =============================================================================
 # TRUNK SAMPLING
 # =============================================================================
 
-def sample_trunk_topotoolbox(fd, trunk, dem, spacing: float,
-                              theta: float, a0: float,
-                              ksn_window: int, logger: logging.Logger) -> dict | None:
+def sample_trunk(fd, trunk, dem, spacing, theta, a0, ksn_window, logger):
     """
-    Sample trunk metrics using topotoolbox's native flow accumulation where
-    available, falling back to a linear drainage area approximation if not.
+    Sample trunk metrics using topotoolbox native methods:
+      - fd.flow_accumulation()         : upstream contributing area (GridObject)
+      - trunk.ezgetnal(dem)            : elevation NAL at each trunk node
+      - trunk.chitransform(acc)        : chi NAL at each trunk node
+      - trunk.ksn(dem, acc, theta)     : ksn NAL at each trunk node
+      - trunk.distance()               : distance from mouth NAL (m)
 
-    Returns a dict of arrays or None on failure.
+    All NALs are co-indexed. Ksn uses the native topotoolbox implementation
+    (slope/area normalisation) with optional minima imposition to avoid
+    negative slopes. NALs are sorted mouth->headwater then resampled to
+    uniform spacing for export.
+
+    Returns a dict of uniformly spaced arrays, or None on failure.
     """
     try:
-        coord_groups = trunk.xy()
-        if not coord_groups:
-            logger.warning("  trunk.xy() returned no coordinates.")
-            return None
+        # ── Native topotoolbox metrics ─────────────────────────────────────────
+        acc      = fd.flow_accumulation()
+        elev_nal = np.asarray(trunk.ezgetnal(dem),                          dtype=float)
+        chi_nal  = np.asarray(trunk.chitransform(acc, mn=theta, a0=a0),    dtype=float)
+        ksn_nal  = np.asarray(trunk.ksn(dem, acc, impose=True, theta=theta), dtype=float)
+        dist_nal = np.asarray(trunk.upstream_distance(),                    dtype=float)
+        acc_nal  = np.asarray(trunk.ezgetnal(acc),                          dtype=float)
 
+        cellsize  = float(dem.cellsize)
+        drain_nal = np.where(acc_nal > 0, acc_nal * (cellsize ** 2), cellsize ** 2)
+
+        # ── Sort mouth -> headwater ────────────────────────────────────────────
+        order     = np.argsort(dist_nal)
+        dist_nal  = dist_nal[order]
+        elev_nal  = elev_nal[order]
+        chi_nal   = chi_nal[order]
+        ksn_nal   = ksn_nal[order]
+        drain_nal = drain_nal[order]
+
+        # ── Remove duplicate distance values to avoid gradient divide-by-zero ──
+        _, unique_idx = np.unique(dist_nal, return_index=True)
+        dist_nal  = dist_nal[unique_idx]
+        elev_nal  = elev_nal[unique_idx]
+        chi_nal   = chi_nal[unique_idx]
+        ksn_nal   = ksn_nal[unique_idx]
+        drain_nal = drain_nal[unique_idx]
+
+        # ── Smooth ksn with moving window ─────────────────────────────────────
+        ksn_nal = moving_average(ksn_nal, ksn_window)
+
+        # ── Slope from elevation gradient (for export only) ───────────────────
+        slope_nal = np.clip(np.abs(np.gradient(elev_nal, dist_nal)), 1e-6, None)
+
+        # ── XY coordinates aligned to dist_nal ────────────────────────────────
+        # Always interpolate xy onto dist_nal using cumulative chord distance
+        # along the trunk coordinate list. This is robust regardless of whether
+        # node counts match after sorting and deduplication.
+        coord_groups = trunk.xy()
         all_coords = []
         for group in coord_groups:
             all_coords.extend(group)
         coords = np.array(all_coords)
 
-        if len(coords) < 2:
-            return None
-
-        # ── Distance along trunk ───────────────────────────────────────────────
-        dists_raw = np.zeros(len(coords))
+        dists_xy = np.zeros(len(coords))
         for i in range(1, len(coords)):
-            dists_raw[i] = dists_raw[i - 1] + np.hypot(
-                coords[i, 0] - coords[i - 1, 0],
-                coords[i, 1] - coords[i - 1, 1]
+            dists_xy[i] = dists_xy[i-1] + np.hypot(
+                coords[i,0] - coords[i-1,0],
+                coords[i,1] - coords[i-1,1]
             )
+        xs_nal = np.interp(dist_nal, dists_xy, coords[:,0])
+        ys_nal = np.interp(dist_nal, dists_xy, coords[:,1])
 
-        sample_dists = np.arange(0, dists_raw[-1], spacing)
-        xs = np.interp(sample_dists, dists_raw, coords[:, 0])
-        ys = np.interp(sample_dists, dists_raw, coords[:, 1])
+        # ── Resample to uniform spacing ────────────────────────────────────────
+        sample_dists = np.arange(0, dist_nal[-1], spacing)
+        xs        = np.interp(sample_dists, dist_nal, xs_nal)
+        ys        = np.interp(sample_dists, dist_nal, ys_nal)
+        elevation = np.interp(sample_dists, dist_nal, elev_nal)
+        chi       = np.interp(sample_dists, dist_nal, chi_nal)
+        drain     = np.interp(sample_dists, dist_nal, drain_nal)
+        slope     = np.interp(sample_dists, dist_nal, slope_nal)
+        ksn       = np.interp(sample_dists, dist_nal, ksn_nal)
 
-        # ── Elevation ─────────────────────────────────────────────────────────
-        cellsize = float(dem.cellsize)
-        # dem.transform is an affine matrix; .c = x left edge, .f = y top edge
-        origin_x = float(dem.transform.c)  # west edge (x origin)
-        origin_y = float(dem.transform.f)  # north edge (y origin)
-
-        def xy_to_rc(x, y):
-            col = ((x - origin_x) / cellsize).astype(int)
-            row = ((origin_y - y) / cellsize).astype(int)
-            return row, col
-
-        rows, cols = xy_to_rc(xs, ys)
-        rows = np.clip(rows, 0, dem.z.shape[0] - 1)
-        cols = np.clip(cols, 0, dem.z.shape[1] - 1)
-        elevation = dem.z[rows, cols].astype(float)
-
-        # ── Drainage area ──────────────────────────────────────────────────────
-        try:
-            acc = tt.flowacc(fd)
-            acc_grid = np.array(acc.z).astype(float)
-            drainage_area = acc_grid[rows, cols] * (cellsize ** 2)
-            drainage_area = np.where(drainage_area <= 0, cellsize ** 2, drainage_area)
-            logger.info("  Using topotoolbox flow accumulation for drainage area.")
-        except Exception:
-            n = len(sample_dists)
-            drainage_area = np.linspace(n * cellsize ** 2, cellsize ** 2, n)
-            logger.info("  Using linear drainage area approximation.")
-
-        # ── Slope, chi, ksn ───────────────────────────────────────────────────
-        slope = np.clip(np.abs(np.gradient(elevation, sample_dists)), 1e-6, None)
-        chi = compute_chi(sample_dists, drainage_area, theta, a0)
-        ksn = compute_ksn(slope, drainage_area, theta, ksn_window)
+        n_nan_elev = int(np.sum(np.isnan(elevation)))
+        n_nan_ksn  = int(np.sum(np.isnan(ksn)))
+        logger.info(f"  Sampled {len(sample_dists)} points "
+                    f"({dist_nal[-1]/1000:.2f} km trunk, {spacing:.0f} m spacing) "
+                    f"| NaN elev: {n_nan_elev}, NaN ksn: {n_nan_ksn}")
 
         return {
             "x": xs, "y": ys,
             "distance_m":       sample_dists,
             "elevation_m":      elevation,
-            "drainage_area_m2": drainage_area,
+            "drainage_area_m2": drain,
             "slope":            slope,
             "chi":              chi,
             "ksn":              ksn,
         }
 
     except Exception as e:
-        logger.error(f"  topotoolbox sampling failed: {e}", exc_info=True)
+        logger.error(f"  Trunk sampling failed: {e}", exc_info=True)
         return None
 
 
-def sample_trunk_numpy(trunk_xy, dem_path: Path, cellsize: float,
-                       spacing: float, theta: float, a0: float,
-                       ksn_window: int, logger: logging.Logger) -> dict | None:
-    """
-    Pure-numpy fallback for trunk sampling when topotoolbox methods fail.
-    Uses a linear drainage area approximation.
-
-    Returns a dict of arrays or None on failure.
-    """
-    try:
-        all_coords = []
-        for group in trunk_xy:
-            all_coords.extend(group)
-
-        if len(all_coords) < 2:
-            return None
-
-        coords = np.array(all_coords)
-
-        dists_raw = np.zeros(len(coords))
-        for i in range(1, len(coords)):
-            dists_raw[i] = dists_raw[i - 1] + np.hypot(
-                coords[i, 0] - coords[i - 1, 0],
-                coords[i, 1] - coords[i - 1, 1]
-            )
-
-        sample_dists = np.arange(0, dists_raw[-1], spacing)
-        xs = np.interp(sample_dists, dists_raw, coords[:, 0])
-        ys = np.interp(sample_dists, dists_raw, coords[:, 1])
-
-        with rasterio.open(str(dem_path)) as src:
-            transform = src.transform
-            dem_data = src.read(1).astype(float)
-            nodata = src.nodata
-            if nodata is not None:
-                dem_data[dem_data == nodata] = np.nan
-
-            def xy_to_rc(x, y):
-                col = (x - transform.c) / transform.a
-                row = (y - transform.f) / transform.e
-                return row.astype(int), col.astype(int)
-
-            rows, cols = xy_to_rc(xs, ys)
-            rows = np.clip(rows, 0, dem_data.shape[0] - 1)
-            cols = np.clip(cols, 0, dem_data.shape[1] - 1)
-            elevation = dem_data[rows, cols]
-
-        n = len(sample_dists)
-        drainage_area = np.linspace(n * cellsize ** 2, cellsize ** 2, n)
-
-        slope = np.clip(np.abs(np.gradient(elevation, sample_dists)), 1e-6, None)
-        chi = compute_chi(sample_dists, drainage_area, theta, a0)
-        ksn = compute_ksn(slope, drainage_area, theta, ksn_window)
-
-        return {
-            "x": xs, "y": ys,
-            "distance_m":       sample_dists,
-            "elevation_m":      elevation,
-            "drainage_area_m2": drainage_area,
-            "slope":            slope,
-            "chi":              chi,
-            "ksn":              ksn,
-        }
-
-    except Exception as e:
-        logger.error(f"  numpy fallback failed: {e}", exc_info=True)
-        return None
-
-
-# =============================================================================
 # KSN / CHI EXPORTS
 # =============================================================================
 
@@ -457,45 +376,87 @@ def export_ksn_chi_points(data: dict, basin_dir: Path, out_crs,
 
 def export_plots(data: dict, basin_dir: Path, basin_name: str,
                  logger: logging.Logger) -> None:
-    """Generate and save the three elevation profile plots."""
+    """
+    Generate and save three elevation profile plots.
+
+    Elevation vs Distance and Elevation vs Chi are line plots — both x-axes
+    are monotonically increasing along the profile so a connected line makes
+    sense.
+
+    Elevation vs Ksn uses distance as the x-axis with the line coloured by
+    ksn value. Plotting ksn directly on the x-axis produces a tangled line
+    because ksn is not monotonic, making the plot unreadable.
+    """
     dist_km = data["distance_m"] / 1000.0
     elev    = data["elevation_m"]
     chi     = data["chi"]
     ksn     = data["ksn"]
 
-    plot_specs = [
-        {
-            "x":        dist_km,
-            "xlabel":   "Distance from mouth (km)",
-            "filename": "plot_elev_distance.png",
-            "title":    f"{basin_name} - Elevation vs Distance",
-        },
-        {
-            "x":        chi,
-            "xlabel":   f"Chi (m/n = {THETA_REF}, A0 = {A0} m^2)",
-            "filename": "plot_elev_chi.png",
-            "title":    f"{basin_name} - Elevation vs Chi",
-        },
-        {
-            "x":        ksn,
-            "xlabel":   f"Ksn (smoothed, window = {KSN_WINDOW} pts x {POINT_SPACING_M} m)",
-            "filename": "plot_elev_ksn.png",
-            "title":    f"{basin_name} - Elevation vs Ksn",
-        },
-    ]
+    if np.all(np.isnan(elev)):
+        logger.warning("  Skipping all plots — elevation data is all NaN")
+        return
 
-    for spec in plot_specs:
+    # ── Elevation vs Distance ──────────────────────────────────────────────────
+    for x_vals, xlabel, filename, title in [
+        (dist_km, "Distance from mouth (km)",
+         "plot_elev_distance.png", f"{basin_name} - Elevation vs Distance"),
+        (chi,     f"Chi (m/n = {THETA_REF}, A0 = {A0} m^2)",
+         "plot_elev_chi.png",      f"{basin_name} - Elevation vs Chi"),
+    ]:
+        if np.all(np.isnan(x_vals)):
+            logger.warning(f"  Skipping {filename} — x data is all NaN")
+            continue
         fig, ax = plt.subplots(figsize=(9, 5))
-        ax.plot(spec["x"], elev, color="#2563eb", linewidth=1.2)
-        ax.set_xlabel(spec["xlabel"], fontsize=11)
+        ax.plot(x_vals, elev, color="#2563eb", linewidth=1.2)
+        ax.set_xlabel(xlabel, fontsize=11)
         ax.set_ylabel("Elevation (m)", fontsize=11)
-        ax.set_title(spec["title"], fontsize=12, fontweight="bold")
+        ax.set_title(title, fontsize=12, fontweight="bold")
         ax.grid(True, linestyle="--", alpha=0.4)
         fig.tight_layout()
-        out_path = basin_dir / spec["filename"]
+        out_path = basin_dir / filename
         fig.savefig(str(out_path), dpi=150)
         plt.close(fig)
         logger.info(f"  Saved plot -> {out_path}")
+
+    # ── Elevation vs Distance, coloured by Ksn ────────────────────────────────
+    # Ksn is not monotonic so plotting it on the x-axis produces a tangled
+    # line. Instead we plot distance on x, elevation on y, and colour each
+    # segment by its ksn value using a LineCollection.
+    if not np.all(np.isnan(ksn)):
+        from matplotlib.collections import LineCollection
+        from matplotlib.cm import ScalarMappable
+        from matplotlib.colors import Normalize
+
+        fig, ax = plt.subplots(figsize=(9, 5))
+
+        # Build segments: each segment connects adjacent sample points
+        points  = np.array([dist_km, elev]).T.reshape(-1, 1, 2)
+        segs    = np.concatenate([points[:-1], points[1:]], axis=1)
+        ksn_mid = (ksn[:-1] + ksn[1:]) / 2.0   # ksn value for each segment
+
+        norm = Normalize(vmin=np.nanpercentile(ksn, 5),
+                         vmax=np.nanpercentile(ksn, 95))
+        lc = LineCollection(segs, cmap="plasma", norm=norm, linewidth=2)
+        lc.set_array(ksn_mid)
+        ax.add_collection(lc)
+
+        ax.set_xlim(dist_km.min(), dist_km.max())
+        ax.set_ylim(elev.min() - 20, elev.max() + 20)
+        cbar = fig.colorbar(ScalarMappable(norm=norm, cmap="plasma"), ax=ax)
+        cbar.set_label(f"Ksn (smoothed, window = {KSN_WINDOW} pts x {POINT_SPACING_M} m)",
+                       fontsize=10)
+        ax.set_xlabel("Distance from mouth (km)", fontsize=11)
+        ax.set_ylabel("Elevation (m)", fontsize=11)
+        ax.set_title(f"{basin_name} - Elevation Profile coloured by Ksn",
+                     fontsize=12, fontweight="bold")
+        ax.grid(True, linestyle="--", alpha=0.4)
+        fig.tight_layout()
+        out_path = basin_dir / "plot_elev_ksn.png"
+        fig.savefig(str(out_path), dpi=150)
+        plt.close(fig)
+        logger.info(f"  Saved plot -> {out_path}")
+    else:
+        logger.warning("  Skipping plot_elev_ksn.png — ksn data is all NaN")
 
 
 # =============================================================================
@@ -551,23 +512,15 @@ def process_basin(basin_dir: Path, logger: logging.Logger) -> bool:
         export_stream_network(s_main, basin_dir, out_crs, logger)
 
         # ── Step 8: Sample trunk metrics ──────────────────────────────────────
-        logger.info("  Step 8: Sampling trunk metrics (topotoolbox)...")
-        data = sample_trunk_topotoolbox(
+        logger.info("  Step 8: Sampling trunk metrics...")
+        data = sample_trunk(
             fd, trunk, dem,
             spacing=POINT_SPACING_M, theta=THETA_REF, a0=A0,
             ksn_window=KSN_WINDOW, logger=logger,
         )
 
         if data is None:
-            logger.warning("  topotoolbox sampling failed — trying numpy fallback...")
-            data = sample_trunk_numpy(
-                trunk.xy(), dem_path, cellsize,
-                spacing=POINT_SPACING_M, theta=THETA_REF, a0=A0,
-                ksn_window=KSN_WINDOW, logger=logger,
-            )
-
-        if data is None:
-            logger.error("  Both sampling methods failed — ksn/chi outputs skipped.")
+            logger.error("  Trunk sampling failed — ksn/chi outputs skipped.")
             # Still count as partial success since network exports completed
             return True
 
