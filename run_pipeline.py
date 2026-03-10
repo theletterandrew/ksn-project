@@ -37,8 +37,9 @@ SCRIPTS_TO_RUN = [
     # "las_to_dem.py",
     # "mosaic_dem.py",
     # "wbt_hydrology.py",
-    "basins.py",
-    "topotoolbox_analysis.py"
+    "check_tt.py"
+    # "basins.py",
+    # "topotoolbox_analysis.py"
 ]
 
 
